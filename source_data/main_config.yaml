@@ -1,0 +1,17 @@
+api_endpoint: "https://db.ygoprodeck.com/api/v7/cardinfo.php"
+paths:
+  raw_image_dir: "data/raw_images/"
+  processed_dir: "data/processed/"
+  database_file: "data/processed/card_database.pkl"
+  art_embeddings_file: "data/processed/art_embeddings.npy"
+  meta_embeddings_file: "data/processed/meta_embeddings.npy"
+  lore_embeddings_file: "data/processed/lore_embeddings.npy"
+clip_model: "openai/clip-vit-base-patch32"
+sentence_transformer_model: "pkshatech/simcse-ja-bert-base-clcmlp"
+adaptive_crop:
+  crossover_date: "2011-03-19"
+  pre_crossover_coords: [0.125, 0.26, 0.875, 0.58]
+  post_crossover_coords: [0.11, 0.25, 0.89, 0.59]
+scaling:
+  atk_def_max: 5000
+  level_rank_max: 12
