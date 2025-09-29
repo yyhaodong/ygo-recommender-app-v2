@@ -1,199 +1,196 @@
-# -*- coding: utf-8 -*-
+# app.py
 import streamlit as st
-import numpy as np
 import pandas as pd
-from pathlib import Path
+import numpy as np
+from typing import Optional, List
+
 from recommender_v2 import RecommenderV2
 
-# -----------------------------
-# 基本設定
-# -----------------------------
-st.set_page_config(
-    page_title="遊戯王カード 多モーダル推薦エンジン",
-    page_icon="🔮",
-    layout="wide",
-)
+# ====== 基本設定 ======
+PAGE_TITLE = "🔮 遊戯王カード 多モーダル推薦エンジン"
+HF_DATASET_REPO = "oneonehaodong/ygo-recommender-data"  # 変更する場合はここだけ
 
-HF_REPO = "oneonehaodong/ygo-recommender-data"
+st.set_page_config(page_title="YGO Recommender", layout="wide")
 
-@st.cache_resource(show_spinner=True)
-def load_recommender():
-    return RecommenderV2.from_hf(HF_REPO)
 
-rec = load_recommender()
-DB: pd.DataFrame = rec.db
-
-# 画像URLの取り出し（データに合わせて安全に）
-def get_image_url(row: pd.Series) -> str | None:
-    # 1) もし image_url 列があればそれを使う
-    for key in ["image_url", "img_url", "card_image", "picture"]:
-        if key in row and pd.notna(row[key]) and str(row[key]).strip():
-            return str(row[key]).strip()
-    # 2) もし id 系の数値があれば一般的な YGOPRODECK URL を試す（なければ None）
-    for key in ["id", "card_id", "ygoprodeck_id"]:
-        if key in row and pd.notna(row[key]):
-            try:
-                cid = int(row[key])
-                return f"https://images.ygoprodeck.com/images/cards_cropped/{cid}.jpg"
-            except Exception:
-                pass
+# ====== ユーティリティ ======
+def _first_exist(colnames: List[str], df: pd.DataFrame) -> Optional[str]:
+    """候補リストのうち最初に存在する列名を返す。見つからなければ None。"""
+    for c in colnames:
+        if c in df.columns:
+            return c
     return None
 
-# テキスト（日本語）整形
-def safe_text(v, default="—"):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+
+def _col(df: pd.DataFrame, *cands: str) -> Optional[str]:
+    return _first_exist(list(cands), df)
+
+
+def _image_url_from_row(row: pd.Series, df: pd.DataFrame) -> Optional[str]:
+    img_col = _col(df, "image_url", "img_url", "image", "img", "picture_url")
+    return None if img_col is None else row.get(img_col, None)
+
+
+def _text_from_row(row: pd.Series, df: pd.DataFrame, cands: List[str], default: str = "—") -> str:
+    c = _first_exist(cands, df)
+    if c is None:
         return default
-    s = str(v).strip()
-    return s if s else default
+    v = row.get(c, default)
+    if pd.isna(v):
+        return default
+    return str(v)
 
-# -----------------------------
-# サイドバー：パラメータ
-# -----------------------------
-with st.sidebar:
-    st.markdown("### 🔍 検索パラメータ")
 
-    # カード名
-    names = DB["name"].astype(str).dropna().sort_values().unique().tolist()
-    selected_name = st.selectbox(
-        "カード名を選択",
-        options=names,
-        index=0 if names else None,
-        help="推薦の基準となるカードを選びます。右側に推薦結果が表示されます。",
-    )
+# ====== モデル・データのロード ======
+@st.cache_resource(show_spinner=True)
+def load_recommender() -> RecommenderV2:
+    return RecommenderV2.from_hf(HF_DATASET_REPO)
 
-    # 表示枚数
-    top_n = st.slider(
-        "表示する枚数",
-        min_value=5,
-        max_value=30,
-        value=12,
-        step=1,
-        help="推薦結果として表示するカードの枚数（5〜30）。",
-    )
 
-    # 融合戦略
-    fusion_label = st.selectbox(
-        "融合戦略",
-        options=["rrf", "power_mean"],
-        index=0,
-        help=(
-            "複数モダリティのスコアをどう統合するかを選びます。\n"
-            "・rrf：順位を重視し、スコアの尺度差に強い（安定）。\n"
-            "・power_mean：スコアのバランスを重視（全体的に高い候補が有利）。"
-        ),
-    )
+rec = load_recommender()
+DB = rec.db  # 便宜用
 
-    # 多様性 (MMR)
-    use_mmr = st.checkbox(
-        "多様性 (MMR) を有効化",
-        value=True,
-        help="似すぎたカードが並び過ぎないようにする再ランキングを有効にします。",
-    )
 
-    lam = st.slider(
-        "関連性 vs 多様性 (λ)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.70,
-        step=0.01,
-        help="0に近いほど関連性重視、1に近いほど多様性重視になります。",
-    )
+# ====== サイドバー（操作） ======
+st.sidebar.title("🛠 検索パラメータ")
 
-# -----------------------------
-# メインヘッダ
-# -----------------------------
-st.markdown(
-    "<h1 style='margin-top:0'>🔮 遊戯王カード 多モーダル推薦エンジン</h1>",
-    unsafe_allow_html=True,
+# カード選択
+all_names = DB["name"].astype(str).sort_values().tolist()
+selected_name = st.sidebar.selectbox(
+    "カード名を選択",
+    options=["（選択してください）"] + all_names,
+    index=0,
 )
 
-# -----------------------------
-# 選択中カードの情報ボックス
-# -----------------------------
-if selected_name:
-    base_row = DB.loc[DB["name"].astype(str) == selected_name]
-    if not base_row.empty:
-        base_row = base_row.iloc[0]
-        img_url = get_image_url(base_row)
+# 表示枚数
+top_n = st.sidebar.slider(
+    "表示する枚数",
+    min_value=5, max_value=30, value=12, step=1,
+    help="推薦結果として表示するカードの枚数（5〜30）。"
+)
 
-        with st.container(border=True):
-            st.markdown("#### 🃏 選択中のカード")
-            col_img, col_info = st.columns([1, 2], vertical_alignment="top")
-            with col_img:
-                if img_url:
-                    st.image(img_url, use_container_width=True)
-                else:
-                    st.info("画像が見つかりませんでした。")
+# 融合戦略
+fusion = st.sidebar.selectbox(
+    "融合戦略",
+    options=["rrf", "power_mean"],
+    index=0,
+    help=(
+        "複数モダリティ（イラスト・フレーバー・メタ）のスコアをどう統合するか。\n"
+        "・rrf：順位ベースの統合。スコアの尺度差に強く、安定。\n"
+        "・power_mean：スコアをプール平均。全体的に高い候補が有利。"
+    )
+)
 
-            with col_info:
-                st.markdown(f"**名前**：{safe_text(base_row.get('name'))}")
-                # 代表的な補助情報（存在すれば表示）
-                line = []
-                for k in ["type", "race", "attribute", "frameType", "category"]:
-                    if k in DB.columns:
-                        v = safe_text(base_row.get(k))
-                        if v != "—":
-                            line.append(f"{k}: {v}")
-                if line:
-                    st.caption(" / ".join(line))
+# 多様性（MMR）
+use_mmr = st.sidebar.checkbox("多様性 (MMR) を有効化", value=True)
+mmr_lambda = st.sidebar.slider(
+    "関連性 vs 多様性 (λ)",
+    min_value=0.0, max_value=1.0, value=0.70, step=0.01,
+    help="1.0 に近いほど関連性を重視、0.0 に近いほど多様性を重視。"
+)
 
-                # 効果テキスト等（列名に応じて拾う）
-                effect_key = None
-                for k in ["desc", "effect", "lore", "text", "jp_text", "ja_text"]:
-                    if k in DB.columns:
-                        effect_key = k
-                        break
-                if effect_key:
-                    txt = safe_text(base_row.get(effect_key))
-                    with st.expander("効果テキストを表示", expanded=False):
-                        st.write(txt)
+# ====== メイン（UI） ======
+st.title(PAGE_TITLE)
+
+# ヒント
+if selected_name == "（選択してください）":
+    st.info("左サイドバーからカードを選んでください。")
+    st.stop()
+
+# 選択カードの行
+try:
+    row = DB.loc[DB["name"].astype(str) == selected_name].iloc[0]
+except IndexError:
+    st.error("選択したカードが見つかりませんでした。")
+    st.stop()
+
+# ---------- 選択カードの情報（画面最上段） ----------
+st.subheader("🎴 選択中のカード")
+col_img, col_info = st.columns([1, 2])  # ← vertical_alignment は使えない（存在しない引数）
+
+with col_img:
+    url = _image_url_from_row(row, DB)
+    if url:
+        st.image(url, use_column_width=True)
     else:
-        st.warning("選択したカードがデータベースで見つかりませんでした。")
+        st.markdown("（画像なし）")
 
-# -----------------------------
-# 推薦の実行
-# -----------------------------
-if selected_name:
-    try:
-        df_rec = rec.recommend(
-            query_name=selected_name,
-            top_n=int(top_n),
-            k_each=150,
-            fusion=fusion_label,
-            p_power=1.5,
-            use_mmr=use_mmr,
-            mmr_lambda=float(lam),
-        )
+with col_info:
+    name = str(row.get("name", "—"))
+    tpe = _text_from_row(row, DB, ["type", "card_type", "category"])
+    race = _text_from_row(row, DB, ["race", "tribe", "attribute"])
+    arche = _text_from_row(row, DB, ["archetype", "series"])
+    atk = _text_from_row(row, DB, ["atk"], "—")
+    dfn = _text_from_row(row, DB, ["def", "defense"], "—")
+    desc = _text_from_row(row, DB, ["desc", "description", "lore"], "—")
 
-        if df_rec.empty:
-            st.info("推薦候補が見つかりませんでした。パラメータを調整してください。")
-        else:
-            st.markdown("#### 🎯 推薦結果")
-            # グリッド表示
-            ncols = 5 if top_n >= 15 else 4
-            rows = (len(df_rec) + ncols - 1) // ncols
-            for r in range(rows):
-                cols = st.columns(ncols, vertical_alignment="top")
-                for c in range(ncols):
-                    i = r * ncols + c
-                    if i >= len(df_rec):
-                        break
-                    row = df_rec.iloc[i]
-                    with cols[c]:
-                        img = get_image_url(row)
-                        if img:
-                            st.image(img, use_container_width=True)
-                        st.markdown(f"**{safe_text(row.get('name'))}**")
-                        # スコアの小さな説明
-                        st.caption(
-                            "art: {:.4f} / lore: {:.4f} / meta: {:.4f} / final: {:.4f}".format(
-                                float(row.get("art_sim", 0.0)),
-                                float(row.get("lore_sim", 0.0)),
-                                float(row.get("meta_sim", 0.0)),
-                                float(row.get("final_score", 0.0)),
-                            )
-                        )
-    except Exception as e:
-        st.error(f"推薦中にエラーが発生しました：{e}")
-else:
-    st.info("左のサイドバーからカードを選んでください。")
+    st.markdown(
+        f"""
+        <div style="display:flex; flex-direction:column; gap:6px;">
+            <h3 style="margin:0;">{name}</h3>
+            <div>タイプ：<b>{tpe}</b>　/　分類：<b>{race}</b>　/　シリーズ：<b>{arche}</b></div>
+            <div>ATK：<b>{atk}</b>　/　DEF：<b>{dfn}</b></div>
+            <div style="margin-top:6px; line-height:1.5;">{desc}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.divider()
+
+# ---------- 推薦の実行 ----------
+@st.cache_data(show_spinner=True, ttl=600)
+def _recommend_cached(qname: str, n: int, fusion_label: str, use_mmr_flag: bool, lam: float) -> pd.DataFrame:
+    return rec.recommend(
+        query_name=qname,
+        top_n=int(n),
+        k_each=150,
+        fusion=fusion_label,
+        use_mmr=use_mmr_flag,
+        mmr_lambda=float(lam),
+    )
+
+
+st.subheader("✨ 推薦結果")
+with st.spinner("計算中..."):
+    results = _recommend_cached(selected_name, top_n, fusion, use_mmr, mmr_lambda)
+
+if results.empty:
+    st.warning("推薦結果が空でした。別のカードでお試しください。")
+    st.stop()
+
+# ---------- グリッド表示 ----------
+# 画像列名を特定
+img_colname = _col(results, "image_url", "img_url", "image", "img", "picture_url")
+
+# 4列グリッドに表示
+N_COLS = 4
+rows = int(np.ceil(len(results) / N_COLS))
+
+for r in range(rows):
+    cols = st.columns(N_COLS)
+    for c in range(N_COLS):
+        idx = r * N_COLS + c
+        if idx >= len(results):
+            continue
+        item = results.iloc[idx]
+        with cols[c]:
+            # 画像
+            if img_colname and pd.notna(item.get(img_colname, None)):
+                st.image(item[img_colname], use_column_width=True)
+            else:
+                st.markdown("（画像なし）")
+
+            # テキスト：名前＋スコア
+            nm = str(item.get("name", "—"))
+            score = float(item.get("final_score", 0.0))
+            st.markdown(f"**{nm}**  \nScore: `{score:.4f}`")
+
+            # 追加情報（必要に応じて）
+            if "art_sim" in item and "lore_sim" in item and "meta_sim" in item:
+                st.caption(
+                    f"art: {item['art_sim']:.3f} / lore: {item['lore_sim']:.3f} / meta: {item['meta_sim']:.3f}"
+                )
+
+st.caption("提示されたスコアは候補集合内での相対値です。MMR を有効化すると多様性が高まります。")
+
