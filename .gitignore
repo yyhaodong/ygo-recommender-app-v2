@@ -9,3 +9,4 @@ __pycache__/
 .venv/
 __pycache__/
 .DS_Store
+source_data/*.npy
