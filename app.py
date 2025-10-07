@@ -1,4 +1,4 @@
-# app.py — 遊戯王カード 多モーダル推薦（日本語UI・名称/画像/カメラ・左右对比）
+# app.py — 遊戯王カード 多モーダル推薦（日本語UI・名称/画像/カメラ・左右対比）
 from __future__ import annotations
 import os, re, json
 from io import BytesIO
@@ -13,11 +13,11 @@ from PIL import Image
 
 APP_ROOT = Path(__file__).resolve().parent
 
-# ======== 你的 CLIP 配置（已根据 512 维度确认） ========
+# ======== CLIP 設定（512 次元で確認） ========
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"
 
-# 可选：如果存在 clip_config.json，就用文件里的配置覆盖
+# 任意: clip_config.json があれば上書き
 if os.path.exists("clip_config.json"):
     try:
         _cfg = json.load(open("clip_config.json", "r", encoding="utf-8"))
@@ -27,31 +27,26 @@ if os.path.exists("clip_config.json"):
         pass
 
 # =========================
-# 画像显示（在线URL优先）
+# 画像表示（URL優先）
 # =========================
 def show_image_url(value: str | None, *, caption=None):
     if not value:
-        st.write("—")
-        return
+        st.write("—"); return
     url = str(value)
     try:
         if url.startswith(("http://", "https://")):
-            r = requests.get(url, timeout=8)
-            r.raise_for_status()
+            r = requests.get(url, timeout=8); r.raise_for_status()
             st.image(BytesIO(r.content), caption=caption, use_column_width=True)
         else:
-            st.warning("画像URLが無効です（ローカルパスが検出されました）。")
+            st.warning("画像URLが無効です（ローカルパス検出）。")
             st.caption(url)
     except Exception as e:
         st.warning("画像の読み込みに失敗しました。")
-        st.caption(url)
-        st.caption(f"→ {e}")
+        st.caption(url); st.caption(f"→ {e}")
 
 def safe_columns(n: int):
-    try:
-        n = int(n or 1)
-    except Exception:
-        n = 1
+    try: n = int(n or 1)
+    except Exception: n = 1
     return st.columns(max(1, min(n, 6)), gap="small")
 
 def pill(text: str):
@@ -61,26 +56,26 @@ def pill(text: str):
         unsafe_allow_html=True,
     )
 
-def fmt(v):
-    return "-" if pd.isna(v) else str(v)
+def fmt(v): return "-" if pd.isna(v) else str(v)
 
 def similarity_bar(label: str, value: float, note: str=""):
     try:
-        v = float(value)
-        v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
+        v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
     except Exception:
         v = 0.0
     pct = int(round(v * 100))
     st.markdown(f"**{label}：{pct}%**  {note}")
-    bar = f"""
-    <div style="background:#eee;border-radius:10px;height:12px;overflow:hidden;">
-      <div style="width:{pct}%;height:100%;background:#16a34a;"></div>
-    </div>
-    """
-    st.markdown(bar, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div style="background:#eee;border-radius:10px;height:12px;overflow:hidden;">
+          <div style="width:{pct}%;height:100%;background:#16a34a;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # =========================
-# 页面设置 & 数据加载
+# ページ設定 & データ読込
 # =========================
 st.set_page_config(page_title="遊戯王カード 多モーダル推薦", page_icon="🔮", layout="wide")
 st.title("🔮 遊戯王カード 多モーダル推薦エンジン")
@@ -93,22 +88,19 @@ def get_recommender():
 rec = get_recommender()
 DF: pd.DataFrame = rec.db.copy()
 
-# 运行时生成图片 URL（优先已有URL列 → 数字ID拼 YGOPRO）
+# 実行時に画像URL作成（既存URL列 → 数字IDで YGOPRO）
 def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
-    # 1) 已有 URL 列
     for col in ["image_url", "img_url", "thumbnail_url", "card_image_url", "url"]:
         if col in df.columns:
             s = df[col].astype(str)
             http_mask = s.str.startswith(("http://", "https://"), na=False)
             if http_mask.any():
                 return s.where(http_mask, other=None)
-    # 2) 数字 ID → YGOPRODeck
     cand = None
     for col in ["image_path", "img", "thumbnail", "id", "passcode", "konami_id", "code"]:
         if col in df.columns:
             cand = df[col].astype(str); break
-    if cand is None:
-        return pd.Series([None]*len(df), index=df.index)
+    if cand is None: return pd.Series([None]*len(df), index=df.index)
     ids = cand.str.extract(r"(\d{5,})", expand=False)
     base = "https://images.ygoprodeck.com/images/cards/"
     url = base + ids + ".jpg"
@@ -116,7 +108,7 @@ def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
 
 DF["image_url_runtime"] = make_runtime_image_url(DF)
 
-# 列名容错
+# 列名フォールバック
 COL_NAME  = "name" if "name" in DF.columns else DF.columns[0]
 COL_TYPE  = next((c for c in ["type", "card_type", "race", "frameType"] if c in DF.columns), None)
 COL_ATK   = next((c for c in ["atk", "ATK"] if c in DF.columns), None)
@@ -137,7 +129,7 @@ def image_url_for_row(row: pd.Series) -> str | None:
     return None
 
 # =========================
-# CLIP 编码器（可选，未安装也能用名称搜索）
+# CLIP エンコーダ（未導入でも名称検索は動く）
 # =========================
 ENCODER_OK = False
 try:
@@ -150,8 +142,8 @@ try:
     model_clip, preprocess_clip, torch = get_img_encoder()
     ENCODER_OK = True
     st.caption(f"🔧 CLIP: {MODEL_NAME} / {PRETRAINED}")
-except Exception as e:
-    st.info("画像検索は未有効（torch/open-clip 未安装或加载失败）。")
+except Exception:
+    st.info("画像検索は未有効（torch/open-clip 未インストールまたは読み込み失敗）。")
     ENCODER_OK = False
 
 def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
@@ -164,13 +156,12 @@ def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
         return feat.cpu().numpy()[0].astype(np.float32)
 
 # =========================
-# 侧栏（日本语化）
+# サイドバー
 # =========================
 with st.sidebar:
     st.header("🛠 検索パラメータ")
     mode = st.radio("モード", ["かんたん", "上級"], horizontal=True)
 
-    # 三入口：名 / 画像 / カメラ
     tab_name, tab_image, tab_camera = st.tabs(["カード名", "画像から", "カメラ"])
     effective_query_name = None
     query = None
@@ -222,13 +213,12 @@ with st.sidebar:
         else:
             st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
-    # 若未使用图片/拍照，则退回到名称
     if not effective_query_name:
         effective_query_name = query or None
 
     topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
     fusion  = st.selectbox("融合方式", ["rrf", "power_mean"], index=0,
-                           help="RRF：スコアの尺度に頑健。power_mean：複数モダリティが同時に高い候補を優遇。")
+                           help="RRF：スコア尺度に頑健。power_mean：複数モダリティ同時高得点を優遇。")
     p_power = st.slider("冪平均 p（>1 ほど“同時に高得点”を優遇）", 1.0, 3.0, 1.5, 0.1,
                         disabled=(fusion != "power_mean"))
 
@@ -244,7 +234,7 @@ with st.sidebar:
     fire  = st.button("🔮 検索", use_container_width=True)
 
 # =========================
-# 渲染
+# レンダリング
 # =========================
 def render_card_full(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
@@ -266,6 +256,7 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     show_image_url(image_url_for_row(row), caption=None)
     st.markdown(f"**{d.get(COL_NAME, 'Unknown')}**")
+    # 外側だけの expander（ネスト禁止のため内側は削除）
     with st.expander("詳細を見る"):
         similarity_bar("🖼️ 画像類似度",  d.get("art_sim", 0.0),  "絵柄・色味などの近さ")
         similarity_bar("📖 テキスト類似度", d.get("lore_sim", 0.0), "効果テキストの意味の近さ")
@@ -275,9 +266,10 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
         st.write(f"ATK : {fmt(d.get(COL_ATK))}")
         st.write(f"DEF : {fmt(d.get(COL_DEF))}")
         if COL_DESC:
-            with st.expander("効果テキスト / Notes（さらに表示）", expanded=False):
-                st.write(d.get(COL_DESC) or "—")
+            st.markdown("**効果テキスト / Notes**")
+            st.write(d.get(COL_DESC) or "—")
 
+# デバッグ
 if debug:
     http_ok = DF["image_url_runtime"].astype(str).str.startswith(("http://","https://"), na=False).sum()
     st.info("🔧 デバッグ情報")
@@ -289,7 +281,7 @@ if debug:
     st.dataframe(DF[[COL_NAME, "image_url_runtime"]].head(10))
 
 # =========================
-# 主流程
+# メイン処理
 # =========================
 if fire:
     if not effective_query_name:
