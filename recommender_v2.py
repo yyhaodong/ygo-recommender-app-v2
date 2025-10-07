@@ -1,4 +1,4 @@
-# recommender_v2.py (最终修正版)
+# recommender_v2.py — final optimized and corrected version
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
@@ -18,7 +18,7 @@ class RecommenderV2:
                  art_embs: np.ndarray,
                  lore_embs: np.ndarray,
                  meta_embs: np.ndarray):
-        
+
         self.db = card_df.reset_index(drop=True)
         # 预 L2 归一化，后续使用点积即可
         self.art = self._l2(art_embs)
@@ -26,10 +26,11 @@ class RecommenderV2:
         self.meta = self._l2(meta_embs)
 
         # name/idx 快速映射
-        self.name2idx = pd.Series(self.db.index.values,
-                                  index=self.db["name"].astype(str)).to_dict()
+        self.name2idx = pd.Series(
+            self.db.index.values,
+            index=self.db["name"].astype(str)
+        ).to_dict()
 
-    # [修正] @staticmethod 移动到了正确的位置 (类级别)
     @staticmethod
     def _l2(X: np.ndarray) -> np.ndarray:
         X = X.astype(np.float32, copy=False)
@@ -48,7 +49,6 @@ class RecommenderV2:
     # --------- 融合 ----------
     @staticmethod
     def _rrf(ranks_dict: dict, k: int = 60) -> dict[int, float]:
-        # [修正] 文档字符串移动到了函数内部
         """Reciprocal Rank Fusion; 对分数尺度不敏感，更稳健。"""
         fused = {}
         for ranks in ranks_dict.values():
@@ -103,14 +103,14 @@ class RecommenderV2:
         while len(selected_indices_in_pool) < min(top_n, len(cand_idx)) and remaining_indices_in_pool:
             penal = sim_mat[remaining_indices_in_pool][:, selected_indices_in_pool].max(axis=1)
             mmr = lam * rel_vec[remaining_indices_in_pool] - (1.0 - lam) * penal
-            
+
             nxt_local = int(np.argmax(mmr))
             nxt_global = remaining_indices_in_pool.pop(nxt_local)
             selected_indices_in_pool.append(nxt_global)
 
         return [cand_idx[i] for i in selected_indices_in_pool]
 
-    # --------- 主流程 ----------
+    # --------- 主流程（按名称） ----------
     def recommend(self, query_name: str,
                   top_n: int = 12,
                   k_each: int = 150,
@@ -139,7 +139,7 @@ class RecommenderV2:
                 "lore": ranks_from(lore_s),
                 "meta": ranks_from(meta_s)
             })
-        else: # power_mean
+        else:
             fused = self._power_mean({
                 "art": self._minmax_on_pool(art_s, pool),
                 "lore": self._minmax_on_pool(lore_s, pool),
@@ -159,18 +159,68 @@ class RecommenderV2:
         out["final_score"] = [float(fused.get(i, 0.0)) for i in final_idx]
         return out
 
-    # --------- 便捷构造（从 Hugging Face 数据集加载） ----------
-    # [修正] @classmethod 移动到了正确的位置
+    # --------- 辅助：以图搜图找到最近邻的英文卡名 ----------
+    def nearest_card_by_art(self, art_vec: np.ndarray) -> tuple[int, str, float]:
+        """
+        给定一张图片的艺术向量（与 self.art 同空间），返回：(最近邻索引, 英文卡名, 相似度)
+        """
+        v = art_vec.astype(np.float32)
+        v = v / (np.linalg.norm(v) + 1e-9)
+        sims = np.dot(self.art, v).astype(np.float32)
+        idx = int(np.argmax(sims))
+        name = str(self.db.iloc[idx]["name"])
+        return idx, name, float(sims[idx])
+
+    # 可选：直接用图片向量做推荐（不映射卡名）
+    def recommend_by_art_vector(self, art_vec: np.ndarray,
+                                top_n: int = 12,
+                                k_each: int = 150,
+                                fusion: str = "rrf",
+                                p_power: float = 1.5,
+                                use_mmr: bool = True,
+                                mmr_lambda: float = 0.7) -> pd.DataFrame:
+        v = art_vec.astype(np.float32)
+        v = v / (np.linalg.norm(v) + 1e-9)
+        art_s = np.dot(self.art, v).astype(np.float32)
+        lore_s = np.zeros_like(art_s, dtype=np.float32)  # 无文本，置零
+        meta_s = np.zeros_like(art_s, dtype=np.float32)
+        # 复用“名称版”的流程：构造 pool → 融合 → MMR
+        # 这里简化，直接借助 recommend 的内部逻辑改写也可；目前提供一个快速实用版
+        # 召回池
+        def _topk(scores):
+            k = min(k_each, len(scores))
+            idx = np.argpartition(-scores, k-1)[:k]
+            return idx[np.argsort(-scores[idx])]
+        art_c = _topk(art_s)
+        pool = list(set(art_c))  # 只有 art 通道
+        # 融合
+        if fusion == "rrf":
+            ranks = {cid: r+1 for r, cid in enumerate(sorted(pool, key=lambda i: -art_s[i]))}
+            fused = self._rrf({"art": ranks})
+        else:
+            fused = self._power_mean({"art": self._minmax_on_pool(art_s, pool),
+                                      "lore": {i:0.0 for i in pool},
+                                      "meta": {i:0.0 for i in pool}}, p=p_power)
+        pre = sorted(pool, key=lambda i: -fused.get(i, 0.0))
+        final_idx = self._mmr_rerank(pre[:3*top_n], fused, top_n, mmr_lambda) if use_mmr else pre[:top_n]
+
+        out = self.db.iloc[final_idx].copy()
+        out["art_sim"] = [float(art_s[i]) for i in final_idx]
+        out["lore_sim"] = [0.0 for _ in final_idx]
+        out["meta_sim"] = [0.0 for _ in final_idx]
+        out["final_score"] = [float(fused.get(i, 0.0)) for i in final_idx]
+        return out
+
+    # --------- 从 Hugging Face 数据集加载 ----------
     @classmethod
     def from_hf(cls, repo_id: str):
         local_dir = Path(snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
-            # [修正] 移除了无法识别的符号
             allow_patterns=["*.parquet", "*.npz"]
         ))
-        df = pd.read_parquet(local_dir / "card_database.parquet")
-        art = np.load(local_dir / "art_embs.npz")["data"]
+        df   = pd.read_parquet(local_dir / "card_database.parquet")
+        art  = np.load(local_dir / "art_embs.npz")["data"]
         lore = np.load(local_dir / "lore_embs.npz")["data"]
         meta = np.load(local_dir / "meta_embs.npz")["data"]
         return cls(df, art, lore, meta)
