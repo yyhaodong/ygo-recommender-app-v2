@@ -38,7 +38,7 @@ def show_image_url(value: str | None, *, caption=None):
         if url.startswith(("http://", "https://")):
             r = requests.get(url, timeout=8)
             r.raise_for_status()
-            st.image(BytesIO(r.content), use_container_width=True, caption=caption)
+            st.image(BytesIO(r.content), caption=caption, use_column_width=True)
         else:
             st.warning("画像URLが無効です（ローカルパスが検出されました）。")
             st.caption(url)
@@ -193,7 +193,7 @@ with st.sidebar:
                 except Exception:
                     st.error("画像URLの取得に失敗しました。")
             if pil is not None:
-                st.image(pil, caption="クエリ画像プレビュー", use_container_width=True)
+                st.image(pil, caption="クエリ画像プレビュー", use_column_width=True)
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)
@@ -210,7 +210,7 @@ with st.sidebar:
             cam = st.camera_input("カメラで撮影して検索", label_visibility="collapsed")
             if cam is not None:
                 pil = Image.open(cam)
-                st.image(pil, caption="カメラ画像プレビュー", use_container_width=True)
+                st.image(pil, caption="カメラ画像プレビュー", use_column_width=True)
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)

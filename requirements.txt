@@ -3,7 +3,7 @@ pandas==2.2.2
 numpy==1.26.4
 huggingface-hub==0.23.5
 pyarrow==16.1.0
-torch
-open-clip-torch
+requests>=2.31.0
+Pillow>=10.0.0
+torch==2.8.0
 open_clip_torch==3.2.0
-
