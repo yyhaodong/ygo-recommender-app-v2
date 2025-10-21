@@ -58,12 +58,16 @@ def pill(text: str):
 
 def fmt(v): return "-" if pd.isna(v) else str(v)
 
+# --- 展示の丸め修正：100%に“誤って”ならないように（真=1.0の時だけ100） ---
 def similarity_bar(label: str, value: float, note: str=""):
     try:
         v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
     except Exception:
         v = 0.0
-    pct = int(round(v * 100))
+    if v >= 1 - 1e-6:
+        pct = 100
+    else:
+        pct = int(np.floor(v * 100))  # 向下取整
     st.markdown(f"**{label}：{pct}%**  {note}")
     st.markdown(
         f"""
@@ -82,8 +86,20 @@ st.title("🔮 遊戯王カード 多モーダル推薦エンジン")
 
 @st.cache_resource(show_spinner="推薦エンジンとデータを読み込み中…")
 def get_recommender():
-    from recommender_v2 import RecommenderV2
-    return RecommenderV2.from_hf("oneonehaodong/ygo-recommender-data")
+    # --- ここが重要：MetaEngine を有効化してロード ---
+    from recommender_v2 import RecommenderV2, MetaWeights
+    return RecommenderV2.from_hf(
+        "oneonehaodong/ygo-recommender-data",
+        use_meta_engine=True,                                   # ← 新規
+        meta_engine_kwargs=dict(                                # ← 新規（列名はHFデータに合わせて必要なら調整）
+            level_col="level", atk_col="atk", def_col="def",
+            type_col="type", attribute_col="attribute", race_col="race",
+            meta_w=MetaWeights(  # 既定: Cat 0.40, Level 0.30, ATK 0.15, DEF 0.15
+                w_cat=0.40, w_level=0.30, w_atk=0.15, w_def=0.15,
+                w_type=0.50, w_attr=0.25, w_race=0.25
+            )
+        )
+    )
 
 rec = get_recommender()
 DF: pd.DataFrame = rec.db.copy()
@@ -256,7 +272,6 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     show_image_url(image_url_for_row(row), caption=None)
     st.markdown(f"**{d.get(COL_NAME, 'Unknown')}**")
-    # 外側だけの expander（ネスト禁止のため内側は削除）
     with st.expander("詳細を見る"):
         similarity_bar("🖼️ 画像類似度",  d.get("art_sim", 0.0),  "絵柄・色味などの近さ")
         similarity_bar("📖 テキスト類似度", d.get("lore_sim", 0.0), "効果テキストの意味の近さ")
@@ -300,6 +315,7 @@ if fire:
                     top_n=int(topk), k_each=int(k_each),
                     fusion=fusion, p_power=float(p_power),
                     use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda)
+                    # ※ UIは変えない前提なので w_art/w_lore/w_meta は既定値のまま
                 )
             except Exception as e:
                 st.error("推薦の計算に失敗しました。"); st.exception(e); results = None
@@ -311,6 +327,24 @@ if fire:
             for i, (_, row) in enumerate(results.iterrows()):
                 with cols[i % 3]:
                     render_card_compact(row)
+
+            # -------- ここから追加：開発者用デバッグ（UI外観は保持、折りたたみで表示） --------
+            with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
+                st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
+                if rec.meta_engine is not None:
+                    st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
+                    rank_to_debug = st.number_input("対象：メタで並べた上位から何番目を確認（0=1位）", 0, max(0, len(results)-1), 0, 1)
+                    if st.button("この候補の s_num / s_cat / s_meta を表示"):
+                        dbg = rec.debug_meta_components(effective_query_name, rank=int(rank_to_debug))
+                        if dbg is None:
+                            st.warning("MetaEngine が無効です。")
+                        else:
+                            st.json(dbg)
+                            st.caption("s_num=数値核(ATK/DEF/Level), s_cat=カテゴリ(Type/Attribute/Race), s_meta=Meta内部融合")
+                else:
+                    st.info("MetaEngine が無効のため、分解は利用できません。from_hf の引数を確認してください。")
+            # -----------------------------------------------------------------------
+
         else:
             st.info("該当する結果がありません。")
 else:

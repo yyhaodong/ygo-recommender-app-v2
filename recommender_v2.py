@@ -1,4 +1,4 @@
-# recommender_v2.py — final optimized and corrected version (with MetaEngine)
+# recommender_v2.py — final optimized (with MetaEngine + debug_meta_components)
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
@@ -23,18 +23,16 @@ def _split_multi(value):
     if isinstance(value, (list, tuple, set)):
         return [str(x) for x in value]
     s = str(value)
-    # 常见分隔符：| , / ;
     for sep in ["|", ",", "/", ";"]:
         if sep in s:
             return [t.strip() for t in s.split(sep) if t.strip()]
     return [s] if s else []
 
 def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
-    """多值类别 → multi-hot（bool 矩阵优先；fallback float32）；返回矩阵、映射、是否为布尔优化"""
-    tokens_list = [ _split_multi(v) for v in series.fillna("").tolist() ]
+    """多值类别 → multi-hot（bool矩阵优先；fallback float32）"""
+    tokens_list = [_split_multi(v) for v in series.fillna("").tolist()]
     uniq = sorted({tok for toks in tokens_list for tok in toks} or {"UNK"})
     idx = {v:i for i,v in enumerate(uniq)}
-    # 先用布尔，后续可用于Jaccard向量化
     X = np.zeros((len(tokens_list), len(uniq)), dtype=bool)
     for r, toks in enumerate(tokens_list):
         if not toks:
@@ -42,7 +40,7 @@ def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
         else:
             for t in toks:
                 X[r, idx.get(t, idx["UNK"])] = True
-    return X, idx, True  # True 表示布尔矩阵可直接做 Jaccard
+    return X, idx, True
 
 def _l2_rows(X: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     X = X.astype(np.float32, copy=False)
@@ -64,9 +62,8 @@ class MetaWeights:
 class MetaEngine:
     """
     从 DataFrame 拆出 Meta 的数值 + 类别特征，并提供“以某张卡为查询”的相似度向量。
-    - 数值（level/atk/def）：稳健高斯核（带宽=IQR/1.349）
-    - 类别：type/attribute 用 cosine；race 多热优先 Jaccard（布尔），否则退化为 cosine
-    - 内部权重：Cat:Level:ATK:DEF = 0.40:0.30:0.15:0.15
+    - 数值（level/atk/def）：稳健高斯核（带宽=IQR/1.349），可按需改窄
+    - 类别：type/attribute 用 cosine；race 多热优先 Jaccard
     """
     def __init__(self,
                  df: pd.DataFrame,
@@ -87,11 +84,11 @@ class MetaEngine:
                 raise ValueError(f"MetaEngine: 缺少列 '{col}'")
         num = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
         self.num = num
-        # 稳健带宽
+        # 稳健带宽（如需更“锋利”，可将 1.349 改为 2.0 或手动设 sigma）
         q25 = np.percentile(num, 25, axis=0)
         q75 = np.percentile(num, 75, axis=0)
         iqr = np.maximum(q75 - q25, 1e-8)
-        self.sigma = iqr / 1.349  # 可按需改成 /2 提高区分度
+        self.sigma = iqr / 1.349
 
         # -------- 类别矩阵 --------
         self.has_type = type_col in self.df.columns
@@ -118,7 +115,7 @@ class MetaEngine:
             self.race_bool = None
             self.race_norm = None
 
-        # 预先归一化好的权重
+        # 预先归一化好的数值权重（level/atk/def）
         num_w = np.array([self.w.w_level, self.w.w_atk, self.w.w_def], dtype=np.float32)
         self.num_w = num_w / (num_w.sum() + 1e-9)
 
@@ -128,28 +125,22 @@ class MetaEngine:
         return np.exp(-0.5 * quad).astype(np.float32)
 
     def _cat_sim_vec(self, q_idx: int) -> np.ndarray:
-        parts = []
-        ws = []
+        parts, ws = [], []
         if self.type_norm is not None:
-            s = np.dot(self.type_norm, self.type_norm[q_idx])
-            parts.append(s)
+            parts.append(np.dot(self.type_norm, self.type_norm[q_idx]))
             ws.append(self.w.w_type)
         if self.attr_norm is not None:
-            s = np.dot(self.attr_norm, self.attr_norm[q_idx])
-            parts.append(s)
+            parts.append(np.dot(self.attr_norm, self.attr_norm[q_idx]))
             ws.append(self.w.w_attr)
         if self.race_bool is not None:
-            # Jaccard（布尔）
             a = self.race_bool
             q = a[q_idx]
             inter = (a & q).sum(axis=1).astype(np.float32)
             union = (a | q).sum(axis=1).astype(np.float32)
-            s = np.divide(inter, np.maximum(union, 1e-8))
-            parts.append(s)
+            parts.append(np.divide(inter, np.maximum(union, 1e-8)))
             ws.append(self.w.w_race)
         elif self.race_norm is not None:
-            s = np.dot(self.race_norm, self.race_norm[q_idx])
-            parts.append(s)
+            parts.append(np.dot(self.race_norm, self.race_norm[q_idx]))
             ws.append(self.w.w_race)
 
         if not parts:
@@ -221,11 +212,6 @@ class RecommenderV2:
     # --------- 融合（支持模态权重） ----------
     @staticmethod
     def _rrf(ranks_dict: dict, k: int = 60, modality_weights: dict | None = None) -> dict[int, float]:
-        """
-        Reciprocal Rank Fusion；可对不同模态加权（高层主滑块）。
-        ranks_dict: {"art": {cid: rank, ...}, "lore": {...}, "meta": {...}}
-        modality_weights: {"art": wa, "lore": wl, "meta": wm}
-        """
         mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
         fused = {}
         for m, ranks in ranks_dict.items():
@@ -238,20 +224,14 @@ class RecommenderV2:
     def _power_mean(sim_dict: dict[str, dict[int, float]],
                     p: float = 1.5,
                     modality_weights: dict | None = None) -> dict[int, float]:
-        """
-        幂平均融合；可加模态权重（高层主滑块）。
-        sim_dict: {"art": {id:sim}, "lore": {...}, "meta": {...}}
-        """
         mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
         fused = {}
         all_ids = set()
         for d in sim_dict.values():
             all_ids.update(d.keys())
-        # 归一化模态权重
         mw_vec = np.array([mw.get("art",1.0), mw.get("lore",1.0), mw.get("meta",1.0)], dtype=np.float32)
         mw_vec = mw_vec / (mw_vec.sum() + 1e-9)
         for cid in all_ids:
-            # 对缺失模态记 0
             v_art = sim_dict.get("art", {}).get(cid, 0.0)
             v_lor = sim_dict.get("lore", {}).get(cid, 0.0)
             v_met = sim_dict.get("meta", {}).get(cid, 0.0)
@@ -305,7 +285,7 @@ class RecommenderV2:
                   p_power: float = 1.5,
                   use_mmr: bool = True,
                   mmr_lambda: float = 0.7,
-                  # 新增：高层模态权重（来自主滑块）
+                  # 高层模态权重（来自主滑块）
                   w_art: float = 1.0,
                   w_lore: float = 1.0,
                   w_meta: float = 1.0) -> pd.DataFrame:
@@ -321,7 +301,6 @@ class RecommenderV2:
         if self.meta_engine is not None:
             meta_s = self.meta_engine.similarities(q)  # 新版：数值+类别混合
         else:
-            # 兼容旧：余弦 on meta_embs
             if self.meta is None:
                 meta_s = np.zeros(len(self.db), dtype=np.float32)
             else:
@@ -364,6 +343,50 @@ class RecommenderV2:
         out["final_score"] = [float(fused.get(i, 0.0)) for i in final_idx]
         return out
 
+    # --------- 调试方法A：打印数值/类别/融合后的 meta 组件 ----------
+    def debug_meta_components(self, query_name: str, rank: int = 0):
+        """
+        打印并返回：数值相似 s_num、类别相似 s_cat、融合后的 meta 相似 s_meta。
+        rank=0 表示top1候选，rank=1 表示第二名……
+        仅在 use_meta_engine=True 时有效。
+        """
+        if query_name not in self.name2idx:
+            raise ValueError(f"Card '{query_name}' not found.")
+        if self.meta_engine is None:
+            print("[DEBUG] MetaEngine disabled → 正在使用旧的 meta_emb 余弦相似。")
+            return None
+
+        q = self.name2idx[query_name]
+        # 三通道
+        art_s  = np.dot(self.art,  self.art[q]).astype(np.float32)
+        lore_s = np.dot(self.lore, self.lore[q]).astype(np.float32)
+        meta_s = self.meta_engine.similarities(q)
+
+        # 构造候选池（与 recommend 保持一致）
+        k_each = 150
+        art_c  = self._topk_idx(art_s,  k_each, q)
+        lore_c = self._topk_idx(lore_s, k_each, q)
+        meta_c = self._topk_idx(meta_s, k_each, q)
+        pool   = list(set(art_c) | set(lore_c) | set(meta_c))
+
+        # 仅按 meta_s 排一下，查看第 rank 名
+        pre = sorted(pool, key=lambda i: -meta_s[i])
+        if rank >= len(pre):
+            raise ValueError(f"rank {rank} >= pool size {len(pre)}")
+        i = pre[rank]
+
+        # 组件值
+        s_num  = float(self.meta_engine._num_sim_vec(q)[i])
+        s_cat  = float(self.meta_engine._cat_sim_vec(q)[i])
+        s_meta = float(meta_s[i])
+
+        print(f"[DEBUG] query='{query_name}' q_idx={q}  cand_idx={i}  name={self.db.iloc[i]['name']}")
+        print(f"[DEBUG] s_num={s_num:.6f}  s_cat={s_cat:.6f}  s_meta={s_meta:.6f}")
+        print(f"[DEBUG] sigma(level, atk, def) = {self.meta_engine.sigma}")
+        return {"q": int(q), "i": int(i), "name": str(self.db.iloc[i]["name"]),
+                "s_num": s_num, "s_cat": s_cat, "s_meta": s_meta,
+                "sigma": self.meta_engine.sigma.copy()}
+
     # --------- 辅助：以图搜图找到最近邻的英文卡名 ----------
     def nearest_card_by_art(self, art_vec: np.ndarray) -> tuple[int, str, float]:
         v = art_vec.astype(np.float32)
@@ -381,7 +404,6 @@ class RecommenderV2:
                                 p_power: float = 1.5,
                                 use_mmr: bool = True,
                                 mmr_lambda: float = 0.7,
-                                # 新增：高层模态权重
                                 w_art: float = 1.0,
                                 w_lore: float = 1.0,
                                 w_meta: float = 1.0) -> pd.DataFrame:
@@ -389,18 +411,15 @@ class RecommenderV2:
         v = v / (np.linalg.norm(v) + 1e-9)
         art_s = np.dot(self.art, v).astype(np.float32)
         lore_s = np.zeros_like(art_s, dtype=np.float32)
-        # meta 通道：若启用 MetaEngine，可以照样出相似度（用“虚拟查询”？——这里保持与原版一致置零）
         meta_s = np.zeros_like(art_s, dtype=np.float32)
 
-        # 召回池
         def _topk(scores):
             k = min(k_each, len(scores))
             idx = np.argpartition(-scores, k-1)[:k]
             return idx[np.argsort(-scores[idx])]
         art_c = _topk(art_s)
-        pool = list(set(art_c))  # 只有 art 通道
+        pool = list(set(art_c))
 
-        # 融合（支持模态权重）
         mw = {"art": w_art, "lore": w_lore, "meta": w_meta}
         if fusion == "rrf":
             ranks = {cid: r+1 for r, cid in enumerate(sorted(pool, key=lambda i: -art_s[i]))}
