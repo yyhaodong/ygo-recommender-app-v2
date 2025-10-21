@@ -1,6 +1,6 @@
 # app.py — 遊戯王カード 多モーダル推薦（日本語UI・名称/画像/カメラ・左右対比）
 from __future__ import annotations
-import os, re, json
+import os, json
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict
@@ -13,11 +13,9 @@ from PIL import Image
 
 APP_ROOT = Path(__file__).resolve().parent
 
-# ======== CLIP 設定（512 次元で確認） ========
+# ======== CLIP 設定 ========
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"
-
-# 任意: clip_config.json があれば上書き
 if os.path.exists("clip_config.json"):
     try:
         _cfg = json.load(open("clip_config.json", "r", encoding="utf-8"))
@@ -58,16 +56,13 @@ def pill(text: str):
 
 def fmt(v): return "-" if pd.isna(v) else str(v)
 
-# --- 展示の丸め修正：100%に“誤って”ならないように（真=1.0の時だけ100） ---
+# 百分比向下取整（除非真=1）
 def similarity_bar(label: str, value: float, note: str=""):
     try:
         v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
     except Exception:
         v = 0.0
-    if v >= 1 - 1e-6:
-        pct = 100
-    else:
-        pct = int(np.floor(v * 100))  # 向下取整
+    pct = 100 if v >= 1 - 1e-6 else int(np.floor(v * 100))
     st.markdown(f"**{label}：{pct}%**  {note}")
     st.markdown(
         f"""
@@ -86,25 +81,27 @@ st.title("🔮 遊戯王カード 多モーダル推薦エンジン")
 
 @st.cache_resource(show_spinner="推薦エンジンとデータを読み込み中…")
 def get_recommender():
-    # --- ここが重要：MetaEngine を有効化してロード ---
     from recommender_v2 import RecommenderV2, MetaWeights
     return RecommenderV2.from_hf(
         "oneonehaodong/ygo-recommender-data",
-        use_meta_engine=True,                                   # ← 新規
-        meta_engine_kwargs=dict(                                # ← 新規（列名はHFデータに合わせて必要なら調整）
+        use_meta_engine=True,
+        meta_engine_kwargs=dict(
             level_col="level", atk_col="atk", def_col="def",
             type_col="type", attribute_col="attribute", race_col="race",
-            meta_w=MetaWeights(  # 既定: Cat 0.40, Level 0.30, ATK 0.15, DEF 0.15
+            meta_w=MetaWeights(
                 w_cat=0.40, w_level=0.30, w_atk=0.15, w_def=0.15,
                 w_type=0.50, w_attr=0.25, w_race=0.25
-            )
+            ),
+            # ✅ 游戏单位缩放 + σ 下限（在缩放空间）
+            units=(1.0, 100.0, 100.0),   # Level=1, ATK/DEF=100
+            min_sigma=(1.0, 3.0, 3.0),   # 1级/300ATK/300DEF 的下限
+            sigma_scale=1.0
         )
     )
 
 rec = get_recommender()
 DF: pd.DataFrame = rec.db.copy()
 
-# 実行時に画像URL作成（既存URL列 → 数字IDで YGOPRO）
 def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
     for col in ["image_url", "img_url", "thumbnail_url", "card_image_url", "url"]:
         if col in df.columns:
@@ -124,7 +121,6 @@ def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
 
 DF["image_url_runtime"] = make_runtime_image_url(DF)
 
-# 列名フォールバック
 COL_NAME  = "name" if "name" in DF.columns else DF.columns[0]
 COL_TYPE  = next((c for c in ["type", "card_type", "race", "frameType"] if c in DF.columns), None)
 COL_ATK   = next((c for c in ["atk", "ATK"] if c in DF.columns), None)
@@ -134,7 +130,7 @@ COL_DESC  = next((c for c in ["desc", "effect", "text"] if c in DF.columns), Non
 COL_ID    = next((c for c in ["id", "passcode", "konami_id", "code"] if c in DF.columns), None)
 
 def image_url_for_row(row: pd.Series) -> str | None:
-    if "image_url_runtime" in row and pd.notna(row["image_url_runtime"]):
+    if "image_url_runtime" in row and pd.notna(row["image_url_runtime"]]):
         return str(row["image_url_runtime"])
     if COL_ID and pd.notna(row.get(COL_ID)):
         try:
@@ -145,7 +141,7 @@ def image_url_for_row(row: pd.Series) -> str | None:
     return None
 
 # =========================
-# CLIP エンコーダ（未導入でも名称検索は動く）
+# CLIP エンコーダ（任意）
 # =========================
 ENCODER_OK = False
 try:
@@ -284,7 +280,6 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
             st.markdown("**効果テキスト / Notes**")
             st.write(d.get(COL_DESC) or "—")
 
-# デバッグ
 if debug:
     http_ok = DF["image_url_runtime"].astype(str).str.startswith(("http://","https://"), na=False).sum()
     st.info("🔧 デバッグ情報")
@@ -315,7 +310,6 @@ if fire:
                     top_n=int(topk), k_each=int(k_each),
                     fusion=fusion, p_power=float(p_power),
                     use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda)
-                    # ※ UIは変えない前提なので w_art/w_lore/w_meta は既定値のまま
                 )
             except Exception as e:
                 st.error("推薦の計算に失敗しました。"); st.exception(e); results = None
@@ -328,7 +322,7 @@ if fire:
                 with cols[i % 3]:
                     render_card_compact(row)
 
-            # -------- ここから追加：開発者用デバッグ（UI外観は保持、折りたたみで表示） --------
+            # ---- 開発者デバッグ（Meta 相似分解） ----
             with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
                 st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
                 if rec.meta_engine is not None:
@@ -342,9 +336,8 @@ if fire:
                             st.json(dbg)
                             st.caption("s_num=数値核(ATK/DEF/Level), s_cat=カテゴリ(Type/Attribute/Race), s_meta=Meta内部融合")
                 else:
-                    st.info("MetaEngine が無効のため、分解は利用できません。from_hf の引数を確認してください。")
-            # -----------------------------------------------------------------------
-
+                    st.info("MetaEngine が無効のため、分解は利用できません。")
+            # ----------------------------------------
         else:
             st.info("該当する結果がありません。")
 else:
