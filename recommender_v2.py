@@ -1,29 +1,202 @@
-# recommender_v2.py — final optimized and corrected version
+# recommender_v2.py — final optimized and corrected version (with MetaEngine)
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
 from huggingface_hub import snapshot_download
 from pathlib import Path
+from dataclasses import dataclass
 
+# ---------------------- Helper: one-hot / multi-hot ----------------------
+def _build_onehot(series: pd.Series) -> tuple[np.ndarray, dict]:
+    """单值类别 → one-hot（dense float32）；返回矩阵与{值→列}映射"""
+    vals = series.astype(str).fillna("UNK").values
+    uniq = sorted(pd.unique(vals).tolist())
+    idx = {v:i for i,v in enumerate(uniq)}
+    X = np.zeros((len(vals), len(uniq)), dtype=np.float32)
+    for r, v in enumerate(vals):
+        X[r, idx[v]] = 1.0
+    return X, idx
+
+def _split_multi(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x) for x in value]
+    s = str(value)
+    # 常见分隔符：| , / ;
+    for sep in ["|", ",", "/", ";"]:
+        if sep in s:
+            return [t.strip() for t in s.split(sep) if t.strip()]
+    return [s] if s else []
+
+def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
+    """多值类别 → multi-hot（bool 矩阵优先；fallback float32）；返回矩阵、映射、是否为布尔优化"""
+    tokens_list = [ _split_multi(v) for v in series.fillna("").tolist() ]
+    uniq = sorted({tok for toks in tokens_list for tok in toks} or {"UNK"})
+    idx = {v:i for i,v in enumerate(uniq)}
+    # 先用布尔，后续可用于Jaccard向量化
+    X = np.zeros((len(tokens_list), len(uniq)), dtype=bool)
+    for r, toks in enumerate(tokens_list):
+        if not toks:
+            X[r, idx["UNK"]] = True
+        else:
+            for t in toks:
+                X[r, idx.get(t, idx["UNK"])] = True
+    return X, idx, True  # True 表示布尔矩阵可直接做 Jaccard
+
+def _l2_rows(X: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    X = X.astype(np.float32, copy=False)
+    n = np.linalg.norm(X, axis=1, keepdims=True) + eps
+    return X / n
+
+# ---------------------- MetaEngine（游戏逻辑友好） ----------------------
+@dataclass
+class MetaWeights:
+    w_cat: float = 0.40  # 类别大块
+    w_level: float = 0.30
+    w_atk: float = 0.15
+    w_def: float = 0.15
+    # 类别内部按组（type/attribute/race）
+    w_type: float = 0.50
+    w_attr: float = 0.25
+    w_race: float = 0.25
+
+class MetaEngine:
+    """
+    从 DataFrame 拆出 Meta 的数值 + 类别特征，并提供“以某张卡为查询”的相似度向量。
+    - 数值（level/atk/def）：稳健高斯核（带宽=IQR/1.349）
+    - 类别：type/attribute 用 cosine；race 多热优先 Jaccard（布尔），否则退化为 cosine
+    - 内部权重：Cat:Level:ATK:DEF = 0.40:0.30:0.15:0.15
+    """
+    def __init__(self,
+                 df: pd.DataFrame,
+                 level_col: str = "level",
+                 atk_col: str = "atk",
+                 def_col: str = "def",
+                 type_col: str = "type",
+                 attribute_col: str = "attribute",
+                 race_col: str = "race",
+                 meta_w: MetaWeights = MetaWeights()):
+
+        self.df = df.reset_index(drop=True)
+        self.w = meta_w
+
+        # -------- 数值矩阵：N x 3 --------
+        for col in [level_col, atk_col, def_col]:
+            if col not in self.df.columns:
+                raise ValueError(f"MetaEngine: 缺少列 '{col}'")
+        num = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
+        self.num = num
+        # 稳健带宽
+        q25 = np.percentile(num, 25, axis=0)
+        q75 = np.percentile(num, 75, axis=0)
+        iqr = np.maximum(q75 - q25, 1e-8)
+        self.sigma = iqr / 1.349  # 可按需改成 /2 提高区分度
+
+        # -------- 类别矩阵 --------
+        self.has_type = type_col in self.df.columns
+        self.has_attr = attribute_col in self.df.columns
+        self.has_race = race_col in self.df.columns
+
+        if self.has_type:
+            Xtype, _ = _build_onehot(self.df[type_col])
+            self.type_norm = _l2_rows(Xtype)
+        else:
+            self.type_norm = None
+
+        if self.has_attr:
+            Xattr, _ = _build_onehot(self.df[attribute_col])
+            self.attr_norm = _l2_rows(Xattr)
+        else:
+            self.attr_norm = None
+
+        if self.has_race:
+            Xrace, _, is_bool = _build_multihot(self.df[race_col])
+            self.race_bool = Xrace if is_bool else None
+            self.race_norm = None if is_bool else _l2_rows(Xrace.astype(np.float32))
+        else:
+            self.race_bool = None
+            self.race_norm = None
+
+        # 预先归一化好的权重
+        num_w = np.array([self.w.w_level, self.w.w_atk, self.w.w_def], dtype=np.float32)
+        self.num_w = num_w / (num_w.sum() + 1e-9)
+
+    def _num_sim_vec(self, q_idx: int) -> np.ndarray:
+        z = (self.num - self.num[q_idx]) / (self.sigma + 1e-8)  # N x 3
+        quad = np.sum(self.num_w * (z ** 2), axis=1)            # N
+        return np.exp(-0.5 * quad).astype(np.float32)
+
+    def _cat_sim_vec(self, q_idx: int) -> np.ndarray:
+        parts = []
+        ws = []
+        if self.type_norm is not None:
+            s = np.dot(self.type_norm, self.type_norm[q_idx])
+            parts.append(s)
+            ws.append(self.w.w_type)
+        if self.attr_norm is not None:
+            s = np.dot(self.attr_norm, self.attr_norm[q_idx])
+            parts.append(s)
+            ws.append(self.w.w_attr)
+        if self.race_bool is not None:
+            # Jaccard（布尔）
+            a = self.race_bool
+            q = a[q_idx]
+            inter = (a & q).sum(axis=1).astype(np.float32)
+            union = (a | q).sum(axis=1).astype(np.float32)
+            s = np.divide(inter, np.maximum(union, 1e-8))
+            parts.append(s)
+            ws.append(self.w.w_race)
+        elif self.race_norm is not None:
+            s = np.dot(self.race_norm, self.race_norm[q_idx])
+            parts.append(s)
+            ws.append(self.w.w_race)
+
+        if not parts:
+            return np.zeros(len(self.df), dtype=np.float32)
+        W = np.array(ws, dtype=np.float32)
+        W = W / (W.sum() + 1e-9)
+        S = np.vstack(parts).T   # N x G
+        return (S * W).sum(axis=1).astype(np.float32)
+
+    def similarities(self, q_idx: int) -> np.ndarray:
+        s_num = self._num_sim_vec(q_idx)
+        s_cat = self._cat_sim_vec(q_idx)
+        w_cat = self.w.w_cat
+        return ((1.0 - w_cat) * s_num + w_cat * s_cat).astype(np.float32)
+
+# ---------------------- 主推荐器 ----------------------
 class RecommenderV2:
     """
     一个功能完整的、经过性能优化的多模态推荐器。
     - 两阶段召回：argpartition 快速取 Top-K 候选
-    - 融合：RRF（稳健）/ 幂平均（可调 p）
+    - 融合：RRF（可加模态权重）/ 幂平均（可加模态权重）
     - 重排：MMR 提升多样性
     - 预处理：向量 L2 归一化 + float32，点积即余弦
+    - 新：可选 MetaEngine（游戏逻辑友好数值+类别混合度量）
     """
 
     def __init__(self, card_df: pd.DataFrame,
                  art_embs: np.ndarray,
                  lore_embs: np.ndarray,
-                 meta_embs: np.ndarray):
+                 meta_embs: np.ndarray,
+                 *,
+                 use_meta_engine: bool = False,
+                 meta_engine_kwargs: dict = None):
 
         self.db = card_df.reset_index(drop=True)
         # 预 L2 归一化，后续使用点积即可
         self.art = self._l2(art_embs)
         self.lore = self._l2(lore_embs)
-        self.meta = self._l2(meta_embs)
+
+        # 旧：向量化 meta（兼容保留）
+        self.meta = self._l2(meta_embs) if meta_embs is not None else None
+
+        # 可选：启用 MetaEngine
+        self.meta_engine = None
+        if use_meta_engine:
+            meta_engine_kwargs = meta_engine_kwargs or {}
+            self.meta_engine = MetaEngine(self.db, **meta_engine_kwargs)
 
         # name/idx 快速映射
         self.name2idx = pd.Series(
@@ -42,35 +215,49 @@ class RecommenderV2:
     def _topk_idx(sims: np.ndarray, k: int, exclude: int) -> np.ndarray:
         k = min(k, len(sims) - 1)
         idx = np.argpartition(-sims, k)[:k + 1]
-        # 排除查询自身
-        idx = idx[idx != exclude]
+        idx = idx[idx != exclude]  # 排除查询自身
         return idx[np.argsort(-sims[idx])]
 
-    # --------- 融合 ----------
+    # --------- 融合（支持模态权重） ----------
     @staticmethod
-    def _rrf(ranks_dict: dict, k: int = 60) -> dict[int, float]:
-        """Reciprocal Rank Fusion; 对分数尺度不敏感，更稳健。"""
+    def _rrf(ranks_dict: dict, k: int = 60, modality_weights: dict | None = None) -> dict[int, float]:
+        """
+        Reciprocal Rank Fusion；可对不同模态加权（高层主滑块）。
+        ranks_dict: {"art": {cid: rank, ...}, "lore": {...}, "meta": {...}}
+        modality_weights: {"art": wa, "lore": wl, "meta": wm}
+        """
+        mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
         fused = {}
-        for ranks in ranks_dict.values():
+        for m, ranks in ranks_dict.items():
+            w = float(mw.get(m, 1.0))
             for cid, r in ranks.items():
-                fused[cid] = fused.get(cid, 0.0) + 1.0 / (k + r)
+                fused[cid] = fused.get(cid, 0.0) + w * (1.0 / (k + r))
         return fused
 
     @staticmethod
-    def _power_mean(sim_dict: dict[str, dict[int, float]], p: float = 1.5) -> dict[int, float]:
-        """幂平均融合；p>1 时奖励“多模态同时高分”的候选。"""
+    def _power_mean(sim_dict: dict[str, dict[int, float]],
+                    p: float = 1.5,
+                    modality_weights: dict | None = None) -> dict[int, float]:
+        """
+        幂平均融合；可加模态权重（高层主滑块）。
+        sim_dict: {"art": {id:sim}, "lore": {...}, "meta": {...}}
+        """
+        mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
         fused = {}
         all_ids = set()
         for d in sim_dict.values():
             all_ids.update(d.keys())
+        # 归一化模态权重
+        mw_vec = np.array([mw.get("art",1.0), mw.get("lore",1.0), mw.get("meta",1.0)], dtype=np.float32)
+        mw_vec = mw_vec / (mw_vec.sum() + 1e-9)
         for cid in all_ids:
-            s = 0.0
-            cnt = 0
-            for m in ("art", "lore", "meta"):
-                v = sim_dict[m].get(cid, 0.0)
-                s += v ** p
-                cnt += 1
-            fused[cid] = (s / cnt) ** (1.0 / p)
+            # 对缺失模态记 0
+            v_art = sim_dict.get("art", {}).get(cid, 0.0)
+            v_lor = sim_dict.get("lore", {}).get(cid, 0.0)
+            v_met = sim_dict.get("meta", {}).get(cid, 0.0)
+            v = np.array([v_art, v_lor, v_met], dtype=np.float32)
+            s = np.sum(mw_vec * (v ** p))
+            fused[cid] = float((s) ** (1.0 / p))
         return fused
 
     @staticmethod
@@ -95,15 +282,15 @@ class RecommenderV2:
 
         selected_indices_in_pool = []
         remaining_indices_in_pool = list(range(len(cand_idx)))
-        rel_vec = np.array([rel_scores.get(cand_idx[i], 0.0) for i in remaining_indices_in_pool], dtype=np.float32)
+        rel_vec_all = np.array([rel_scores.get(cand_idx[i], 0.0) for i in range(len(cand_idx))], dtype=np.float32)
 
-        first_local_idx = int(np.argmax(rel_vec))
+        first_local_idx = int(np.argmax(rel_vec_all[remaining_indices_in_pool]))
         selected_indices_in_pool.append(remaining_indices_in_pool.pop(first_local_idx))
 
         while len(selected_indices_in_pool) < min(top_n, len(cand_idx)) and remaining_indices_in_pool:
             penal = sim_mat[remaining_indices_in_pool][:, selected_indices_in_pool].max(axis=1)
-            mmr = lam * rel_vec[remaining_indices_in_pool] - (1.0 - lam) * penal
-
+            rel_now = rel_vec_all[remaining_indices_in_pool]
+            mmr = lam * rel_now - (1.0 - lam) * penal
             nxt_local = int(np.argmax(mmr))
             nxt_global = remaining_indices_in_pool.pop(nxt_local)
             selected_indices_in_pool.append(nxt_global)
@@ -117,35 +304,53 @@ class RecommenderV2:
                   fusion: str = "rrf",
                   p_power: float = 1.5,
                   use_mmr: bool = True,
-                  mmr_lambda: float = 0.7) -> pd.DataFrame:
+                  mmr_lambda: float = 0.7,
+                  # 新增：高层模态权重（来自主滑块）
+                  w_art: float = 1.0,
+                  w_lore: float = 1.0,
+                  w_meta: float = 1.0) -> pd.DataFrame:
+
         if query_name not in self.name2idx:
             raise ValueError(f"Card '{query_name}' not found.")
         q = self.name2idx[query_name]
 
-        art_s = np.dot(self.art, self.art[q])
-        lore_s = np.dot(self.lore, self.lore[q])
-        meta_s = np.dot(self.meta, self.meta[q])
+        # --- 三通道相似度向量 ---
+        art_s = np.dot(self.art, self.art[q]).astype(np.float32)
+        lore_s = np.dot(self.lore, self.lore[q]).astype(np.float32)
 
-        art_c = self._topk_idx(art_s, k_each, q)
+        if self.meta_engine is not None:
+            meta_s = self.meta_engine.similarities(q)  # 新版：数值+类别混合
+        else:
+            # 兼容旧：余弦 on meta_embs
+            if self.meta is None:
+                meta_s = np.zeros(len(self.db), dtype=np.float32)
+            else:
+                meta_s = np.dot(self.meta, self.meta[q]).astype(np.float32)
+
+        # --- 召回池 ---
+        art_c  = self._topk_idx(art_s,  k_each, q)
         lore_c = self._topk_idx(lore_s, k_each, q)
         meta_c = self._topk_idx(meta_s, k_each, q)
         pool = list(set(art_c) | set(lore_c) | set(meta_c))
 
+        # --- 融合（支持模态权重） ---
+        mw = {"art": w_art, "lore": w_lore, "meta": w_meta}
         if fusion == "rrf":
             def ranks_from(scores: np.ndarray) -> dict[int, int]:
                 return {cid: r + 1 for r, cid in enumerate(sorted(pool, key=lambda i: -scores[i]))}
             fused = self._rrf({
-                "art": ranks_from(art_s),
+                "art":  ranks_from(art_s),
                 "lore": ranks_from(lore_s),
                 "meta": ranks_from(meta_s)
-            })
+            }, modality_weights=mw)
         else:
             fused = self._power_mean({
-                "art": self._minmax_on_pool(art_s, pool),
+                "art":  self._minmax_on_pool(art_s,  pool),
                 "lore": self._minmax_on_pool(lore_s, pool),
                 "meta": self._minmax_on_pool(meta_s, pool),
-            }, p=p_power)
+            }, p=p_power, modality_weights=mw)
 
+        # --- MMR 重排 ---
         pre_ranked = sorted(pool, key=lambda i: -fused.get(i, 0.0))
         if use_mmr:
             final_idx = self._mmr_rerank(pre_ranked[:3 * top_n], fused, top_n, mmr_lambda)
@@ -153,17 +358,14 @@ class RecommenderV2:
             final_idx = pre_ranked[:top_n]
 
         out = self.db.iloc[final_idx].copy()
-        out["art_sim"] = [float(art_s[i]) for i in final_idx]
-        out["lore_sim"] = [float(lore_s[i]) for i in final_idx]
-        out["meta_sim"] = [float(meta_s[i]) for i in final_idx]
+        out["art_sim"]   = [float(art_s[i]) for i in final_idx]
+        out["lore_sim"]  = [float(lore_s[i]) for i in final_idx]
+        out["meta_sim"]  = [float(meta_s[i]) for i in final_idx]
         out["final_score"] = [float(fused.get(i, 0.0)) for i in final_idx]
         return out
 
     # --------- 辅助：以图搜图找到最近邻的英文卡名 ----------
     def nearest_card_by_art(self, art_vec: np.ndarray) -> tuple[int, str, float]:
-        """
-        给定一张图片的艺术向量（与 self.art 同空间），返回：(最近邻索引, 英文卡名, 相似度)
-        """
         v = art_vec.astype(np.float32)
         v = v / (np.linalg.norm(v) + 1e-9)
         sims = np.dot(self.art, v).astype(np.float32)
@@ -178,14 +380,18 @@ class RecommenderV2:
                                 fusion: str = "rrf",
                                 p_power: float = 1.5,
                                 use_mmr: bool = True,
-                                mmr_lambda: float = 0.7) -> pd.DataFrame:
+                                mmr_lambda: float = 0.7,
+                                # 新增：高层模态权重
+                                w_art: float = 1.0,
+                                w_lore: float = 1.0,
+                                w_meta: float = 1.0) -> pd.DataFrame:
         v = art_vec.astype(np.float32)
         v = v / (np.linalg.norm(v) + 1e-9)
         art_s = np.dot(self.art, v).astype(np.float32)
-        lore_s = np.zeros_like(art_s, dtype=np.float32)  # 无文本，置零
+        lore_s = np.zeros_like(art_s, dtype=np.float32)
+        # meta 通道：若启用 MetaEngine，可以照样出相似度（用“虚拟查询”？——这里保持与原版一致置零）
         meta_s = np.zeros_like(art_s, dtype=np.float32)
-        # 复用“名称版”的流程：构造 pool → 融合 → MMR
-        # 这里简化，直接借助 recommend 的内部逻辑改写也可；目前提供一个快速实用版
+
         # 召回池
         def _topk(scores):
             k = min(k_each, len(scores))
@@ -193,14 +399,17 @@ class RecommenderV2:
             return idx[np.argsort(-scores[idx])]
         art_c = _topk(art_s)
         pool = list(set(art_c))  # 只有 art 通道
-        # 融合
+
+        # 融合（支持模态权重）
+        mw = {"art": w_art, "lore": w_lore, "meta": w_meta}
         if fusion == "rrf":
             ranks = {cid: r+1 for r, cid in enumerate(sorted(pool, key=lambda i: -art_s[i]))}
-            fused = self._rrf({"art": ranks})
+            fused = self._rrf({"art": ranks}, modality_weights=mw)
         else:
             fused = self._power_mean({"art": self._minmax_on_pool(art_s, pool),
                                       "lore": {i:0.0 for i in pool},
-                                      "meta": {i:0.0 for i in pool}}, p=p_power)
+                                      "meta": {i:0.0 for i in pool}}, p=p_power, modality_weights=mw)
+
         pre = sorted(pool, key=lambda i: -fused.get(i, 0.0))
         final_idx = self._mmr_rerank(pre[:3*top_n], fused, top_n, mmr_lambda) if use_mmr else pre[:top_n]
 
@@ -213,7 +422,10 @@ class RecommenderV2:
 
     # --------- 从 Hugging Face 数据集加载 ----------
     @classmethod
-    def from_hf(cls, repo_id: str):
+    def from_hf(cls, repo_id: str,
+                *,
+                use_meta_engine: bool = False,
+                meta_engine_kwargs: dict = None):
         local_dir = Path(snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
@@ -222,5 +434,8 @@ class RecommenderV2:
         df   = pd.read_parquet(local_dir / "card_database.parquet")
         art  = np.load(local_dir / "art_embs.npz")["data"]
         lore = np.load(local_dir / "lore_embs.npz")["data"]
-        meta = np.load(local_dir / "meta_embs.npz")["data"]
-        return cls(df, art, lore, meta)
+        meta = np.load(local_dir / "meta_embs.npz")["data"]  # 兼容旧
+
+        return cls(df, art, lore, meta,
+                   use_meta_engine=use_meta_engine,
+                   meta_engine_kwargs=meta_engine_kwargs)
