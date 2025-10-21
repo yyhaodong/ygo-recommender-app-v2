@@ -1,4 +1,4 @@
-# recommender_v2.py — final optimized (with MetaEngine + debug_meta_components)
+# recommender_v2.py — final optimized (MetaEngine + debug_meta_components) [UNK-safe]
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
@@ -11,35 +11,53 @@ def _build_onehot(series: pd.Series) -> tuple[np.ndarray, dict]:
     """单值类别 → one-hot（dense float32）；返回矩阵与{值→列}映射"""
     vals = series.astype(str).fillna("UNK").values
     uniq = sorted(pd.unique(vals).tolist())
-    idx = {v:i for i,v in enumerate(uniq)}
+    if "UNK" not in uniq:
+        uniq = ["UNK"] + [u for u in uniq if u != "UNK"]
+    idx = {v: i for i, v in enumerate(uniq)}
     X = np.zeros((len(vals), len(uniq)), dtype=np.float32)
+    unk_i = idx["UNK"]
     for r, v in enumerate(vals):
-        X[r, idx[v]] = 1.0
+        j = idx.get(v, unk_i)
+        X[r, j] = 1.0
     return X, idx
 
-def _split_multi(value):
-    if value is None:
+def _split_multi(s: str) -> list[str]:
+    s = s.strip()
+    if not s:
         return []
-    if isinstance(value, (list, tuple, set)):
-        return [str(x) for x in value]
-    s = str(value)
     for sep in ["|", ",", "/", ";"]:
         if sep in s:
-            return [t.strip() for t in s.split(sep) if t.strip()]
-    return [s] if s else []
+            toks = [t.strip() for t in s.split(sep)]
+            return [t for t in toks if t]
+    return [s]
 
 def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
-    """多值类别 → multi-hot（bool矩阵优先；fallback float32）"""
-    tokens_list = [_split_multi(v) for v in series.fillna("").tolist()]
-    uniq = sorted({tok for toks in tokens_list for tok in toks} or {"UNK"})
-    idx = {v:i for i,v in enumerate(uniq)}
-    X = np.zeros((len(tokens_list), len(uniq)), dtype=bool)
+    """
+    多值类别 → multi-hot（优先布尔矩阵，便于 Jaccard）
+    - 永远保证 vocab 里有 'UNK'，避免 idx['UNK'] KeyError
+    - 对任何异常 token 兜底到 UNK
+    """
+    raw_list = series.fillna("").astype(str).tolist()
+    tokens_list = [_split_multi(s) for s in raw_list]
+
+    # 建 vocab，并**强制加入 'UNK'**
+    vocab = {tok for toks in tokens_list for tok in toks if tok}
+    vocab.add("UNK")
+    uniq = sorted(vocab)
+    idx = {v: i for i, v in enumerate(uniq)}
+    unk_i = idx["UNK"]
+
+    # 构造布尔 multi-hot
+    N, D = len(tokens_list), len(uniq)
+    X = np.zeros((N, D), dtype=bool)
     for r, toks in enumerate(tokens_list):
         if not toks:
-            X[r, idx["UNK"]] = True
+            X[r, unk_i] = True
         else:
             for t in toks:
-                X[r, idx.get(t, idx["UNK"])] = True
+                j = idx.get(t, unk_i)
+                X[r, j] = True
+
     return X, idx, True
 
 def _l2_rows(X: np.ndarray, eps: float = 1e-9) -> np.ndarray:
@@ -84,11 +102,11 @@ class MetaEngine:
                 raise ValueError(f"MetaEngine: 缺少列 '{col}'")
         num = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
         self.num = num
-        # 稳健带宽（如需更“锋利”，可将 1.349 改为 2.0 或手动设 sigma）
+        # 稳健带宽
         q25 = np.percentile(num, 25, axis=0)
         q75 = np.percentile(num, 75, axis=0)
         iqr = np.maximum(q75 - q25, 1e-8)
-        self.sigma = iqr / 1.349
+        self.sigma = iqr / 1.349  # 如需更“锋利”，可改为 iqr / 2.0 或手动设置
 
         # -------- 类别矩阵 --------
         self.has_type = type_col in self.df.columns
@@ -96,19 +114,20 @@ class MetaEngine:
         self.has_race = race_col in self.df.columns
 
         if self.has_type:
-            Xtype, _ = _build_onehot(self.df[type_col])
+            Xtype, _ = _build_onehot(self.df[type_col].fillna("UNK").astype(str))
             self.type_norm = _l2_rows(Xtype)
         else:
             self.type_norm = None
 
         if self.has_attr:
-            Xattr, _ = _build_onehot(self.df[attribute_col])
+            Xattr, _ = _build_onehot(self.df[attribute_col].fillna("UNK").astype(str))
             self.attr_norm = _l2_rows(Xattr)
         else:
             self.attr_norm = None
 
         if self.has_race:
-            Xrace, _, is_bool = _build_multihot(self.df[race_col])
+            # 关键：传入 fillna("").astype(str) 保证稳定
+            Xrace, _, is_bool = _build_multihot(self.df[race_col].fillna("").astype(str))
             self.race_bool = Xrace if is_bool else None
             self.race_norm = None if is_bool else _l2_rows(Xrace.astype(np.float32))
         else:
