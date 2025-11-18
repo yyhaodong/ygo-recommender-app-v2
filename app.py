@@ -1,9 +1,9 @@
-# app.py — A/B テスト UI（トップバナー + サイドバー切替）
+# app.py — 遊戯王カード 多モーダル推薦（A/B実験・4列グリッド対応）
 from __future__ import annotations
 import os, json
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,7 @@ from PIL import Image
 
 APP_ROOT = Path(__file__).resolve().parent
 
-# ======== CLIP 設定（512 次元例） ========
+# ======== CLIP 設定（512 次元で確認） ========
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"
 
@@ -30,21 +30,27 @@ if os.path.exists("clip_config.json"):
 # 画像表示（URL優先）
 # =========================
 def show_image_url(value: str | None, *, caption=None):
+    """列幅いっぱいに画像を自動フィットさせる（レスポンシブ）。"""
     if not value:
-        st.write("—"); return
+        st.write("—")
+        return
     url = str(value)
     try:
         if url.startswith(("http://", "https://")):
-            r = requests.get(url, timeout=8); r.raise_for_status()
-            st.image(BytesIO(r.content), caption=caption, use_column_width=True)
+            r = requests.get(url, timeout=8)
+            r.raise_for_status()
+            # 列幅に合わせて自動縮放。スクリーンショット時も崩れにくい。
+            st.image(BytesIO(r.content), caption=caption, use_container_width=True)
         else:
             st.warning("画像URLが無効です（ローカルパス検出）。")
             st.caption(url)
     except Exception as e:
         st.warning("画像の読み込みに失敗しました。")
-        st.caption(url); st.caption(f"→ {e}")
+        st.caption(url)
+        st.caption(f"→ {e}")
 
 def safe_columns(n: int):
+    """古いコード互換（不要なら未使用でOK）。"""
     try: n = int(n or 1)
     except Exception: n = 1
     return st.columns(max(1, min(n, 6)), gap="small")
@@ -58,16 +64,13 @@ def pill(text: str):
 
 def fmt(v): return "-" if pd.isna(v) else str(v)
 
+# 表示の丸め修正：1.0 のみ 100%、それ以外は切り捨て整数％
 def similarity_bar(label: str, value: float, note: str=""):
-    """表示丸め：100% は厳密 1.0 のみ。"""
     try:
         v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
     except Exception:
         v = 0.0
-    if v >= 1 - 1e-6:
-        pct = 100
-    else:
-        pct = int(np.floor(v * 100))
+    pct = 100 if v >= 1 - 1e-6 else int(np.floor(v * 100))
     st.markdown(f"**{label}：{pct}%**  {note}")
     st.markdown(
         f"""
@@ -84,25 +87,17 @@ def similarity_bar(label: str, value: float, note: str=""):
 st.set_page_config(page_title="遊戯王カード 多モーダル推薦", page_icon="🔮", layout="wide")
 st.title("🔮 遊戯王カード 多モーダル推薦エンジン")
 
-# A/B テスト用のトップバナー
-if "ab_system" not in st.session_state:
-    st.session_state["ab_system"] = "B"  # 既定は提案手法
-
-def _banner():
-    if st.session_state["ab_system"] == "A":
-        st.info("🧪 現在テスト中：System A — Baseline (Min-Max + Cosine)", icon="🧪")
-    else:
-        st.success("🧪 現在テスト中：System B — Proposed (Gaussian Kernel / 非線形写像)", icon="🧪")
-
-_banner()
-
 @st.cache_resource(show_spinner="推薦エンジンとデータを読み込み中…")
 def get_recommender():
-    # MetaEngine（RBF）を有効化してロード。BaselineEngine は内部で同時構築。
+    """
+    RecommenderV2 を Hugging Face データセットから構築。
+    - MetaEngine を有効化（System B の数値カーネル用）
+    - Baseline（System A）は meta 埋め込みのコサインにフォールバック
+    """
     from recommender_v2 import RecommenderV2, MetaWeights
     return RecommenderV2.from_hf(
         "oneonehaodong/ygo-recommender-data",
-        use_meta_engine=True,
+        use_meta_engine=True,  # B で使用
         meta_engine_kwargs=dict(
             level_col="level", atk_col="atk", def_col="def",
             type_col="type", attribute_col="attribute", race_col="race",
@@ -110,9 +105,9 @@ def get_recommender():
                 w_cat=0.40, w_level=0.30, w_atk=0.15, w_def=0.15,
                 w_type=0.50, w_attr=0.25, w_race=0.25
             ),
-            # ゲーム単位スケーリング + σ 下限（スケーリング空間）
-            units=(1.0, 100.0, 100.0),    # Level=1, ATK/DEF=100
-            min_sigma=(1.0, 3.0, 3.0),    # 1 レベル / 300 ATK / 300 DEF
+            # ゲーム単位スケーリング + σ 下限（縮尺空間）
+            units=(1.0, 100.0, 100.0),   # Level=1, ATK/DEF=100
+            min_sigma=(1.0, 3.0, 3.0),  # 1級 / 300 ATK / 300 DEF
             sigma_scale=1.0
         )
     )
@@ -120,7 +115,7 @@ def get_recommender():
 rec = get_recommender()
 DF: pd.DataFrame = rec.db.copy()
 
-# 実行時に画像URL作成（URL列があれば優先）
+# 実行時に画像URL作成（既存URL列 → 数字IDで YGOPRO）
 def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
     for col in ["image_url", "img_url", "thumbnail_url", "card_image_url", "url"]:
         if col in df.columns:
@@ -150,7 +145,7 @@ COL_DESC  = next((c for c in ["desc", "effect", "text"] if c in DF.columns), Non
 COL_ID    = next((c for c in ["id", "passcode", "konami_id", "code"] if c in DF.columns), None)
 
 def image_url_for_row(row: pd.Series) -> str | None:
-    """行データから画像URLを推定（ランタイム列→ID連結の順でフォールバック）。"""
+    """画像URLを安全に取得（YGOPROのID補完を含む）。"""
     url_rt = row.get("image_url_runtime", None)
     if pd.notna(url_rt) and isinstance(url_rt, (str, bytes)) and str(url_rt):
         return str(url_rt)
@@ -163,7 +158,7 @@ def image_url_for_row(row: pd.Series) -> str | None:
     return None
 
 # =========================
-# CLIP エンコーダ（任意）
+# CLIP エンコーダ（未導入でも名称検索は動く）
 # =========================
 ENCODER_OK = False
 try:
@@ -177,10 +172,11 @@ try:
     ENCODER_OK = True
     st.caption(f"🔧 CLIP: {MODEL_NAME} / {PRETRAINED}")
 except Exception:
-    st.info("画像検索は未有効（torch/open-clip が未インストール）。")
+    st.info("画像検索は未有効（torch/open-clip 未インストールまたは読み込み失敗）。")
     ENCODER_OK = False
 
 def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
+    """PIL 画像を CLIP ベクトルへ変換（L2 正規化）。"""
     if not ENCODER_OK:
         raise RuntimeError("Image encoder not available.")
     with torch.no_grad():
@@ -189,21 +185,32 @@ def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
         feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.cpu().numpy()[0].astype(np.float32)
 
+def nearest_card_by_art(rec_obj, v: np.ndarray) -> Tuple[int, str, float]:
+    """
+    画像ベクトル v と rec.art のコサインで最も近いカードを返す。
+    - RecommenderV2 に専用APIが無い場合のフォールバック。
+    """
+    sims = np.dot(rec_obj.art, v.astype(np.float32))
+    i = int(np.argmax(sims))
+    name = str(rec_obj.db.iloc[i]["name"])
+    return i, name, float(sims[i])
+
 # =========================
-# サイドバー（A/B 切替 + 検索入力）
+# サイドバー（A/B 切替・検索入力・高度設定）
 # =========================
 with st.sidebar:
-    st.header("🧪 A/B 実験")
-    ab_choice = st.radio(
-        "アルゴリズム切替",
-        ["System A: Baseline (Min-Max + Cosine)", "System B: Proposed (Gaussian Kernel)"],
+    st.header("アルゴリズム切替")
+    ab_label = st.radio(
+        "A/B テスト用：数値類似の計算法を切り替え",
+        options=[
+            "System A: Baseline (Min-Max + Cosine)",
+            "System B: Proposed (Gaussian Kernel)"
+        ],
         index=1
     )
-    st.session_state["ab_system"] = "A" if ab_choice.startswith("System A") else "B"
+    ab_system = "B" if ab_label.startswith("System B") else "A"
 
-    st.divider()
     st.header("🛠 検索パラメータ")
-
     tab_name, tab_image, tab_camera = st.tabs(["カード名", "画像から", "カメラ"])
     effective_query_name = None
     query = None
@@ -226,42 +233,43 @@ with st.sidebar:
                 except Exception:
                     st.error("画像URLの取得に失敗しました。")
             if pil is not None:
-                st.image(pil, caption="クエリ画像プレビュー", use_column_width=True)
+                st.image(pil, caption="クエリ画像プレビュー", use_container_width=True)
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)
-                        # 任意：画像で最近傍の名称を推定する関数を持っている場合に利用
-                        # idx, nn_name, sim = rec.nearest_card_by_art(v)
-                        # effective_query_name = nn_name
-                        st.success("画像特徴の抽出が完了しました。カード名タブで名称を選択してください。")
+                        # フォールバック近傍検索
+                        idx, nn_name, sim = nearest_card_by_art(rec, v)
+                        effective_query_name = nn_name
+                        st.success(f"最も近いカード：**{nn_name}**（sim={sim:.3f}）")
                     except Exception as e:
                         st.error(f"画像検索エラー：{e}")
         else:
-            st.info("画像検索は無効です。torch/open-clip を導入してください。")
+            st.info("torch/open-clip が未インストールのため、画像検索は無効です。")
 
     with tab_camera:
         if ENCODER_OK:
             cam = st.camera_input("カメラで撮影して検索", label_visibility="collapsed")
             if cam is not None:
                 pil = Image.open(cam)
-                st.image(pil, caption="カメラ画像プレビュー", use_column_width=True)
+                st.image(pil, caption="カメラ画像プレビュー", use_container_width=True)
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)
-                        st.success("画像特徴の抽出が完了しました。カード名タブで名称を選択してください。")
+                        idx, nn_name, sim = nearest_card_by_art(rec, v)
+                        effective_query_name = nn_name
+                        st.success(f"最も近いカード：**{nn_name}**（カメラ, sim={sim:.3f}）")
                     except Exception as e:
                         st.error(f"画像検索エラー：{e}")
         else:
-            st.info("カメラ検索は無効です。")
+            st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
     if not effective_query_name:
         effective_query_name = query or None
 
-    # 研究用の詳細パラメータは折り畳みへ
-    with st.expander("Advanced（研究者向け）", expanded=False):
+    with st.expander("Advanced（研究者向け）", expanded=True):
         topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
         fusion  = st.selectbox("融合方式", ["rrf", "power_mean"], index=0,
-                               help="RRF: スコア尺度に頑健 / power_mean: 同時高得点を優遇")
+                               help="RRF：スコア尺度に頑健。power_mean：複数モダリティ同時高得点を優遇。")
         p_power = st.slider("冪平均 p（>1 ほど“同時に高得点”を優遇）", 1.0, 3.0, 1.5, 0.1,
                             disabled=(fusion != "power_mean"))
         k_each     = st.slider("各モダリティの候補数 k_each", 50, 400, 150, 10)
@@ -273,7 +281,7 @@ with st.sidebar:
     fire  = st.button("🔮 検索", use_container_width=True)
 
 # =========================
-# レンダリング
+# 結果カードの描画
 # =========================
 def render_card_full(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
@@ -296,10 +304,10 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
     show_image_url(image_url_for_row(row), caption=None)
     st.markdown(f"**{d.get(COL_NAME, 'Unknown')}**")
     with st.expander("詳細を見る"):
-        similarity_bar("🖼️ 画像類似度",    d.get("art_sim", 0.0),  "絵柄・色味などの近さ")
+        similarity_bar("🖼️ 画像類似度",  d.get("art_sim", 0.0),  "絵柄・色味などの近さ")
         similarity_bar("📖 テキスト類似度", d.get("lore_sim", 0.0), "効果テキストの意味の近さ")
-        similarity_bar("🔢 メタ類似度",     d.get("meta_sim", 0.0), "種別・ATK/DEF 等の一致度")
-        similarity_bar("⭐ 総合スコア",     d.get("final_score", 0.0), "上記を融合した最終評価")
+        similarity_bar("🔢 メタデータ類似度", d.get("meta_sim", 0.0), "種別・ATK/DEF 等の一致度")
+        similarity_bar("⭐ 総合スコア",   d.get("final_score", 0.0), "上記を融合した最終評価")
         st.write(f"種別: {fmt(d.get(COL_TYPE))}")
         st.write(f"ATK : {fmt(d.get(COL_ATK))}")
         st.write(f"DEF : {fmt(d.get(COL_DEF))}")
@@ -307,7 +315,26 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
             st.markdown("**効果テキスト / Notes**")
             st.write(d.get(COL_DESC) or "—")
 
-# デバッグ情報
+def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
+    """
+    結果一覧を「n_cols 列グリッド」で表示する。
+    - 画像は use_container_width=True で列幅に自動フィット
+    - 4 列固定が“正攻法”。スクリーンショット用途にも安定。
+    """
+    cols = st.columns(n_cols, gap="small")
+    for i, (_, row) in enumerate(results_df.iterrows()):
+        with cols[i % n_cols]:
+            render_card_compact(row)
+
+# =========================
+# A/B 横断の通知バナー
+# =========================
+if ab_system == "A":
+    st.info("🧪 現在テスト中：System A（Baseline: Min-Max + Cosine）", icon="🧪")
+else:
+    st.success("🧪 現在テスト中：System B（Proposed: Gaussian Kernel）", icon="🧪")
+
+# デバッグ（任意）
 if debug:
     http_ok = DF["image_url_runtime"].astype(str).str.startswith(("http://","https://"), na=False).sum()
     st.info("🔧 デバッグ情報")
@@ -319,12 +346,9 @@ if debug:
     st.dataframe(DF[[COL_NAME, "image_url_runtime"]].head(10))
 
 # =========================
-# メイン処理
+# メイン処理（A/B 切替はメタ経路の切換で実装）
 # =========================
 if fire:
-    # クリック直後にもバナーを再表示（被験者の見落とし防止）
-    _banner()
-
     if not effective_query_name:
         st.warning("基準となるカード（または画像）を選んでください。")
     else:
@@ -336,31 +360,48 @@ if fire:
 
         with st.spinner("計算中…"):
             try:
+                # --- A/B の切替：
+                # RecommenderV2.recommend の実装に ab_system 引数が無くても動くよう
+                # meta_engine の有効/無効を一時的に切り替えて制御する。
+                _saved_engine = rec.meta_engine
+                if ab_system == "A":
+                    rec.meta_engine = None  # Baseline: メタは埋め込みのコサイン
+                else:
+                    rec.meta_engine = _saved_engine  # Proposed: MetaEngine（RBF/Gaussian）
+
                 results: pd.DataFrame = rec.recommend(
                     query_name=effective_query_name,
                     top_n=int(topk), k_each=int(k_each),
                     fusion=fusion, p_power=float(p_power),
-                    use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda),
-                    ab_system=st.session_state["ab_system"]  # ← A/B 実験の切替
+                    use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda)
                 )
             except Exception as e:
-                st.error("推薦の計算に失敗しました。"); st.exception(e); results = None
+                st.error("推薦の計算に失敗しました。")
+                st.exception(e)
+                results = None
+            finally:
+                # インスタンスを元の状態に戻す（再実行の整合性を保つ）
+                rec.meta_engine = _saved_engine
 
         if results is not None and len(results):
             results = results.join(DF["image_url_runtime"], how="left")
-            st.subheader(f"Top-{int(topk)} の結果")
-            cols = safe_columns(3)
-            for i, (_, row) in enumerate(results.iterrows()):
-                with cols[i % 3]:
-                    render_card_compact(row)
 
-            # 研究者向け：MetaEngine 内部の分解（任意）
-            with st.expander("🔧 研究者向けデバッグ（Meta 分解）", expanded=False):
+            st.subheader(f"Top-{topk} の結果")
+            screenshot_mode = st.toggle("📸 スクリーンショット用（先頭4枚を4列グリッドで表示）", value=False)
+            if screenshot_mode:
+                render_results_grid(results.head(4), n_cols=4)
+            else:
+                render_results_grid(results, n_cols=4)
+
+            # ---- 開発者向け：Meta の分解（B の理解補助） ----
+            with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
                 st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
                 if rec.meta_engine is not None:
                     st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
+                else:
+                    st.caption("Baseline（System A）ではメタは埋め込みコサインで計算。")
+            # ---------------------------------------------------
         else:
             st.info("該当する結果がありません。")
 else:
-    _banner()
     st.info("左側でカード名を選ぶか、画像/カメラで検索して「🔮 検索」を押してください。")
