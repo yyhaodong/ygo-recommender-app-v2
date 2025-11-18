@@ -1,4 +1,4 @@
-# app.py — 遊戯王カード 多モーダル推薦（A/B実験・4列グリッド対応）
+# app.py — 遊戯王カード 多モーダル推薦（A/B実験・4列グリッド・画像互換対応）
 from __future__ import annotations
 import os, json
 from io import BytesIO
@@ -10,6 +10,13 @@ import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
+
+# --- HEIC/HEIF 画像サポート（iPhone対策：未導入でも可）---
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
 
 APP_ROOT = Path(__file__).resolve().parent
 
@@ -27,6 +34,21 @@ if os.path.exists("clip_config.json"):
         pass
 
 # =========================
+# 画像表示ユーティリティ（後方互換）
+# =========================
+def _img_fit(image_obj, *, caption=None):
+    """Streamlitのバージョン差を吸収しつつ、列幅にフィットして画像を表示する。"""
+    try:
+        # 新しめのStreamlit
+        st.image(image_obj, caption=caption, use_container_width=True)
+    except TypeError as e:
+        # 古いStreamlitは use_container_width を受け付けない
+        if "use_container_width" in str(e):
+            st.image(image_obj, caption=caption, use_column_width=True)
+        else:
+            raise
+
+# =========================
 # 画像表示（URL優先）
 # =========================
 def show_image_url(value: str | None, *, caption=None):
@@ -39,8 +61,7 @@ def show_image_url(value: str | None, *, caption=None):
         if url.startswith(("http://", "https://")):
             r = requests.get(url, timeout=8)
             r.raise_for_status()
-            # 列幅に合わせて自動縮放。スクリーンショット時も崩れにくい。
-            st.image(BytesIO(r.content), caption=caption, use_container_width=True)
+            _img_fit(BytesIO(r.content), caption=caption)  # 後方互換ハンドラ経由
         else:
             st.warning("画像URLが無効です（ローカルパス検出）。")
             st.caption(url)
@@ -220,46 +241,50 @@ with st.sidebar:
         query = st.selectbox("カード名を選択", options=names)
 
     with tab_image:
-        if ENCODER_OK:
-            up = st.file_uploader("画像をアップロード", type=["jpg","jpeg","png"])
-            url = st.text_input("または画像URLを貼り付け")
-            pil = None
-            if up:
+        # いつでもアップロード表示（エンコーダ有無に依存しない）
+        up = st.file_uploader("画像をアップロード", type=["jpg","jpeg","png","webp","gif","heic","heif"])
+        url = st.text_input("または画像URLを貼り付け")
+        pil = None
+        if up:
+            try:
                 pil = Image.open(up)
-            elif url:
-                try:
-                    b = requests.get(url, timeout=6).content
-                    pil = Image.open(BytesIO(b))
-                except Exception:
-                    st.error("画像URLの取得に失敗しました。")
-            if pil is not None:
-                st.image(pil, caption="クエリ画像プレビュー", use_container_width=True)
+            except Exception as e:
+                st.error(f"画像の読み込みに失敗しました：{e}")
+        elif url:
+            try:
+                b = requests.get(url, timeout=6).content
+                pil = Image.open(BytesIO(b))
+            except Exception as e:
+                st.error(f"画像URLの取得に失敗しました：{e}")
+
+        if pil is not None:
+            _img_fit(pil, caption="クエリ画像プレビュー")  # 後方互換
+            if ENCODER_OK:
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)
-                        # フォールバック近傍検索
-                        idx, nn_name, sim = nearest_card_by_art(rec, v)
+                        idx, nn_name, sim = nearest_card_by_art(rec, v)  # フォールバック近傍検索
                         effective_query_name = nn_name
                         st.success(f"最も近いカード：**{nn_name}**（sim={sim:.3f}）")
                     except Exception as e:
                         st.error(f"画像検索エラー：{e}")
-        else:
-            st.info("torch/open-clip が未インストールのため、画像検索は無効です。")
+            else:
+                st.info("画像のプレビューのみ（エンコーダ未有効のため検索は省略）。")
 
     with tab_camera:
         if ENCODER_OK:
             cam = st.camera_input("カメラで撮影して検索", label_visibility="collapsed")
             if cam is not None:
-                pil = Image.open(cam)
-                st.image(pil, caption="カメラ画像プレビュー", use_container_width=True)
-                with st.spinner("画像特徴を抽出中…"):
-                    try:
+                try:
+                    pil = Image.open(cam)
+                    _img_fit(pil, caption="カメラ画像プレビュー")  # 後方互換
+                    with st.spinner("画像特徴を抽出中…"):
                         v = encode_pil_to_vec(pil)
                         idx, nn_name, sim = nearest_card_by_art(rec, v)
                         effective_query_name = nn_name
                         st.success(f"最も近いカード：**{nn_name}**（カメラ, sim={sim:.3f}）")
-                    except Exception as e:
-                        st.error(f"画像検索エラー：{e}")
+                except Exception as e:
+                    st.error(f"画像検索エラー：{e}")
         else:
             st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
@@ -318,7 +343,7 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
 def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
     """
     結果一覧を「n_cols 列グリッド」で表示する。
-    - 画像は use_container_width=True で列幅に自動フィット
+    - 画像は use_container_width/use_column_width の後方互換で列幅に自動フィット
     - 4 列固定が“正攻法”。スクリーンショット用途にも安定。
     """
     cols = st.columns(n_cols, gap="small")
@@ -393,14 +418,14 @@ if fire:
             else:
                 render_results_grid(results, n_cols=4)
 
-            # ---- 開発者向け：Meta の分解（B の理解補助） ----
+            # ---- 開発者向け：Meta の分解（B の理解補助）----
             with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
                 st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
                 if rec.meta_engine is not None:
                     st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
                 else:
                     st.caption("Baseline（System A）ではメタは埋め込みコサインで計算。")
-            # ---------------------------------------------------
+            # --------------------------------------------------
         else:
             st.info("該当する結果がありません。")
 else:
