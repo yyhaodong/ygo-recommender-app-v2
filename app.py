@@ -310,19 +310,58 @@ with st.sidebar:
 # =========================
 def render_card_full(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
-    left, right = st.columns([1, 2], gap="small")
-    with left:
-        show_image_url(image_url_for_row(row), caption=d.get(COL_NAME))
-    with right:
-        st.subheader(str(d.get(COL_NAME, "Unknown")))
-        mc = safe_columns(4)
-        mc[0].metric("種別",   fmt(d.get(COL_TYPE)))
-        mc[1].metric("ATK",    fmt(d.get(COL_ATK)))
-        mc[2].metric("DEF",    fmt(d.get(COL_DEF)))
-        mc[3].metric("レア度", fmt(d.get(COL_RAR)))
-        st.write(""); pill("テキスト特徴"); pill("画像特徴"); pill("メタデータ/OCR")
-        with st.expander("効果テキスト / Notes", expanded=True):
-            st.write(d.get(COL_DESC) or "—")
+    # モバイル対応：画像を小さく固定し、横並びレイアウト
+    img_url = image_url_for_row(row) or ""
+    name = str(d.get(COL_NAME, "Unknown"))
+    desc = d.get(COL_DESC) or "—"
+    type_v = fmt(d.get(COL_TYPE))
+    atk_v  = fmt(d.get(COL_ATK))
+    def_v  = fmt(d.get(COL_DEF))
+    st.markdown(f"""
+    <style>
+    .base-card {{
+        display: flex;
+        flex-direction: row;
+        gap: 12px;
+        align-items: flex-start;
+        margin-bottom: 8px;
+    }}
+    .base-card img {{
+        width: 100px;
+        min-width: 100px;
+        height: auto;
+        border-radius: 6px;
+    }}
+    .base-card-info {{
+        flex: 1;
+        min-width: 0;
+    }}
+    .base-card-info h3 {{
+        margin: 0 0 6px 0;
+        font-size: 16px;
+    }}
+    .base-card-meta {{
+        font-size: 12px;
+        color: #aaa;
+        margin-bottom: 6px;
+    }}
+    .base-card-desc {{
+        font-size: 12px;
+        line-height: 1.5;
+        color: #ddd;
+        max-height: 120px;
+        overflow-y: auto;
+    }}
+    </style>
+    <div class="base-card">
+        <img src="{img_url}" alt="{name}">
+        <div class="base-card-info">
+            <h3>{name}</h3>
+            <div class="base-card-meta">種別: {type_v} | ATK: {atk_v} | DEF: {def_v}</div>
+            <div class="base-card-desc">{desc}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 def render_card_compact(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
