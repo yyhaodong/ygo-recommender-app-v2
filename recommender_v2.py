@@ -1,10 +1,11 @@
-# recommender_v2.py — A/B 切替対応（System A: Linear / System B: Gaussian）
+# recommender_v2.py — A/B 切替対応（System A: Linear / System B: Gaussian Route-B）
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
 from huggingface_hub import snapshot_download
 from pathlib import Path
 from dataclasses import dataclass
+
 
 # =========================================================
 # ヘルパ関数
@@ -14,8 +15,8 @@ def _l2_rows(X: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = np.linalg.norm(X, axis=1, keepdims=True) + eps
     return X / n
 
+
 def _build_onehot(series: pd.Series) -> tuple[np.ndarray, dict]:
-    """単一カテゴリ列 → one-hot（float32）。UNK を必ず含める。"""
     vals = series.fillna("UNK").astype(str).values
     uniq = sorted(pd.unique(vals).tolist())
     if "UNK" not in uniq:
@@ -27,6 +28,7 @@ def _build_onehot(series: pd.Series) -> tuple[np.ndarray, dict]:
         X[r, idx.get(v, unk_i)] = 1.0
     return X, idx
 
+
 def _split_multi(s: str) -> list[str]:
     s = s.strip()
     if not s:
@@ -37,10 +39,8 @@ def _split_multi(s: str) -> list[str]:
             return [t for t in toks if t]
     return [s]
 
+
 def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
-    """
-    多値カテゴリ列 → multi-hot（bool）。UNK を必ず含め、未知語は UNK にフォールバック。
-    """
     raw_list = series.fillna("").astype(str).tolist()
     tokens_list = [_split_multi(s) for s in raw_list]
     vocab = {tok for toks in tokens_list for tok in toks if tok}
@@ -58,48 +58,30 @@ def _build_multihot(series: pd.Series) -> tuple[np.ndarray, dict, bool]:
                 X[r, idx.get(t, unk_i)] = True
     return X, idx, True
 
+
 # =========================================================
 # System A: BaselineEngine（線形正規化 + 余弦）
 # =========================================================
 @dataclass
 class LinearWeights:
-    # 大枠：カテゴリ vs 数値
     w_cat: float = 0.40
     w_level: float = 0.30
     w_atk: float = 0.15
     w_def: float = 0.15
-    # カテゴリ内の重み
     w_type: float = 0.50
     w_attr: float = 0.25
     w_race: float = 0.25
 
+
 class BaselineEngine:
-    """
-    System A（Baseline）: Linear Normalization（Min–Max）+ Cosine Similarity
-    学術注釈:
-      - Linear Normalization は「知覚差 ~ 物理差」に線形比例を仮定する。
-      - ゲーム数値（ATK/DEF/Level）では中～高域で知覚歪み（圧縮/膨張）が生じやすい。
-      - 本研究では System B（非線形・RBF）との対照群として用いる。
-    """
-    def __init__(self,
-                 df: pd.DataFrame,
-                 level_col: str = "level",
-                 atk_col: str = "atk",
-                 def_col: str = "def",
-                 type_norm: np.ndarray | None = None,
-                 attr_norm: np.ndarray | None = None,
-                 race_bool: np.ndarray | None = None,
-                 race_norm: np.ndarray | None = None,
-                 lin_w: LinearWeights = LinearWeights()):
+    def __init__(self, df, level_col="level", atk_col="atk", def_col="def",
+                 type_norm=None, attr_norm=None, race_bool=None, race_norm=None,
+                 lin_w=LinearWeights()):
         self.df = df.reset_index(drop=True)
         self.w = lin_w
-
-        # 数値列チェック
         for col in [level_col, atk_col, def_col]:
             if col not in self.df.columns:
                 raise ValueError(f"BaselineEngine: 列 '{col}' が存在しません。")
-
-        # 中央値補完
         num = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
         num[~np.isfinite(num)] = np.nan
         med = np.nanmedian(num, axis=0)
@@ -107,34 +89,27 @@ class BaselineEngine:
         inds = np.where(~np.isfinite(num))
         if inds[0].size:
             num[inds] = med[inds[1]]
-
-        # 列ごとの Min–Max（[0,1]）
         lo = np.nanmin(num, axis=0)
         hi = np.nanmax(num, axis=0)
         span = np.maximum(hi - lo, 1e-9).astype(np.float32)
         self.num_linear = (num - lo) / span
-
-        # 数値サブ重みの正規化
         num_w = np.array([self.w.w_level, self.w.w_atk, self.w.w_def], dtype=np.float32)
         self.num_w = num_w / (num_w.sum() + 1e-9)
-
-        # カテゴリ表現（外部から受け取り・再利用）
         self.type_norm = type_norm
         self.attr_norm = attr_norm
         self.race_bool = race_bool
         self.race_norm = race_norm
 
-    def _num_sim_vec(self, q_idx: int) -> np.ndarray:
-        # 線形正規化後の 3次元を重み付けし、余弦類似度で評価
+    def _num_sim_vec(self, q_idx):
         X = self.num_linear.astype(np.float32, copy=False)
         Xw = X * self.num_w
         qw = Xw[q_idx]
         nX = np.linalg.norm(Xw, axis=1) + 1e-9
         nq = float(np.linalg.norm(qw) + 1e-9)
-        s = (Xw @ qw) / (nX * nq)
-        return np.clip(np.nan_to_num(s, nan=0.0), 0.0, 1.0).astype(np.float32)
+        s = (Xw @ qw) / (nX * nq + 1e-9)
+        return np.clip(np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
 
-    def _cat_sim_vec(self, q_idx: int) -> np.ndarray:
+    def _cat_sim_vec(self, q_idx):
         parts, ws = [], []
         if self.type_norm is not None:
             parts.append(np.dot(self.type_norm, self.type_norm[q_idx])); ws.append(self.w.w_type)
@@ -144,130 +119,77 @@ class BaselineEngine:
             a = self.race_bool; q = a[q_idx]
             inter = (a & q).sum(axis=1).astype(np.float32)
             union = (a | q).sum(axis=1).astype(np.float32)
-            eps = 1e-6
-            parts.append((inter + eps) / (np.maximum(union, eps))); ws.append(self.w.w_race)
+            parts.append((inter + 1e-6) / np.maximum(union, 1e-6)); ws.append(self.w.w_race)
         elif self.race_norm is not None:
             parts.append(np.dot(self.race_norm, self.race_norm[q_idx])); ws.append(self.w.w_race)
-
         if not parts:
             return np.zeros(len(self.df), dtype=np.float32)
         W = np.array(ws, dtype=np.float32); W = W / (W.sum() + 1e-9)
-        S = np.vstack(parts).T
-        return np.clip((S * W).sum(axis=1).astype(np.float32), 0.0, 1.0)
+        return np.clip((np.vstack(parts).T * W).sum(axis=1).astype(np.float32), 0.0, 1.0)
 
-    def similarities(self, q_idx: int) -> np.ndarray:
-        s_num = self._num_sim_vec(q_idx)
-        s_cat = self._cat_sim_vec(q_idx)
-        w_cat = self.w.w_cat
-        s = (1.0 - w_cat) * s_num + w_cat * s_cat
+    def similarities(self, q_idx):
+        s = (1.0 - self.w.w_cat) * self._num_sim_vec(q_idx) + self.w.w_cat * self._cat_sim_vec(q_idx)
         return np.clip(s.astype(np.float32), 0.0, 1.0)
+
 
 # =========================================================
 # System B: MetaEngine（ゲーム単位スケーリング + RBF）
 # =========================================================
 @dataclass
 class MetaWeights:
-    # 大枠：カテゴリ vs 数値
-    w_cat: float = 0.40
-    w_level: float = 0.30
+    w_cat: float = 0.50
+    w_level: float = 0.25
     w_atk: float = 0.15
-    w_def: float = 0.15
-    # カテゴリ内の重み
+    w_def: float = 0.10
     w_type: float = 0.50
     w_attr: float = 0.25
     w_race: float = 0.25
 
-class MetaEngine:
-    """
-    Meta = 数値(Level/ATK/DEF) + カテゴリ(Type/Attribute/Race)
-    - 数値：ゲーム単位空間（Level=1、ATK/DEF=100）で RBF（ガウス核）相似
-      学術注釈: Non-linear Perception Mapping（心理物理の近似）として RBF を採用。
-    - カテゴリ：type/attribute は余弦，race は Jaccard（multi-hot）
-    """
-    def __init__(self,
-                 df: pd.DataFrame,
-                 level_col: str = "level",
-                 atk_col: str = "atk",
-                 def_col: str = "def",
-                 type_col: str = "type",
-                 attribute_col: str = "attribute",
-                 race_col: str = "race",
-                 meta_w: MetaWeights = MetaWeights(),
-                 units: tuple[float, float, float] = (1.0, 100.0, 100.0),
-                 min_sigma: tuple[float, float, float] = (1.0, 3.0, 3.0),
-                 sigma_scale: float = 1.0):
 
+class MetaEngine:
+    def __init__(self, df, level_col="level", atk_col="atk", def_col="def",
+                 type_col="type", attribute_col="attribute", race_col="race",
+                 meta_w=MetaWeights(), units=(1.0, 100.0, 100.0),
+                 min_sigma=(1.0, 3.0, 3.0), sigma_scale=2.0):
         self.df = df.reset_index(drop=True)
         self.w = meta_w
-
-        # -------- 数値特性の取得とクリーニング --------
         for col in [level_col, atk_col, def_col]:
             if col not in self.df.columns:
                 raise ValueError(f"MetaEngine: 列 '{col}' が存在しません。")
-
-        num_raw = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
-
-        num = num_raw.copy()
+        num = self.df[[level_col, atk_col, def_col]].to_numpy(dtype=np.float32)
         num[~np.isfinite(num)] = np.nan
         med = np.nanmedian(num, axis=0)
         med = np.where(np.isfinite(med), med, 0.0).astype(np.float32)
         inds = np.where(~np.isfinite(num))
         if inds[0].size:
             num[inds] = med[inds[1]]
-
-        # ゲーム単位スケーリング（Level=1, ATK/DEF=100）
         self.units = np.array(units, dtype=np.float32)
-        num_scaled = num / (self.units + 1e-9)
-        self.num = num_scaled  # 以降はこの空間で処理
-
-        # RBF の帯域（σ）推定：IQR 基準 + 下限 + スケール
-        q25 = np.nanpercentile(num_scaled, 25, axis=0)
-        q75 = np.nanpercentile(num_scaled, 75, axis=0)
+        self.num = num / (self.units + 1e-9)
+        q25 = np.nanpercentile(self.num, 25, axis=0)
+        q75 = np.nanpercentile(self.num, 75, axis=0)
         iqr = np.maximum(q75 - q25, 1e-6)
-        sigma = iqr / 1.349
-        sigma = np.maximum(sigma, np.array(min_sigma, dtype=np.float32))
-        sigma = sigma * float(sigma_scale)
+        sigma = np.maximum(iqr / 1.349, np.array(min_sigma, dtype=np.float32)) * float(sigma_scale)
         self.sigma = sigma.astype(np.float32)
-
-        # -------- カテゴリ特性 --------
         self.has_type = type_col in self.df.columns
         self.has_attr = attribute_col in self.df.columns
         self.has_race = race_col in self.df.columns
-
-        if self.has_type:
-            Xtype, _ = _build_onehot(self.df[type_col])
-            self.type_norm = _l2_rows(Xtype)
-        else:
-            self.type_norm = None
-
-        if self.has_attr:
-            Xattr, _ = _build_onehot(self.df[attribute_col])
-            self.attr_norm = _l2_rows(Xattr)
-        else:
-            self.attr_norm = None
-
+        self.type_norm = _l2_rows(_build_onehot(self.df[type_col])[0]) if self.has_type else None
+        self.attr_norm = _l2_rows(_build_onehot(self.df[attribute_col])[0]) if self.has_attr else None
         if self.has_race:
             Xrace, _, is_bool = _build_multihot(self.df[race_col])
             self.race_bool = Xrace if is_bool else None
             self.race_norm = None if is_bool else _l2_rows(Xrace.astype(np.float32))
         else:
-            self.race_bool = None
-            self.race_norm = None
-
-        # 数値サブ重みの正規化
+            self.race_bool = self.race_norm = None
         num_w = np.array([self.w.w_level, self.w.w_atk, self.w.w_def], dtype=np.float32)
         self.num_w = num_w / (num_w.sum() + 1e-9)
 
-    # -------- 数値相似（RBF） --------
-    def _num_sim_vec(self, q_idx: int) -> np.ndarray:
-        # z = 差分 / σ，二乗和を重み付きで集約し，exp(-0.5 * quad)
+    def _num_sim_vec(self, q_idx):
         z = (self.num - self.num[q_idx]) / (self.sigma + 1e-9)
-        quad = np.sum(self.num_w * (z ** 2), axis=1)
-        s = np.exp(-0.5 * quad).astype(np.float32)
+        s = np.exp(-0.5 * np.sum(self.num_w * (z ** 2), axis=1)).astype(np.float32)
         return np.clip(np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
 
-    # -------- カテゴリ相似 --------
-    def _cat_sim_vec(self, q_idx: int) -> np.ndarray:
+    def _cat_sim_vec(self, q_idx):
         parts, ws = [], []
         if self.type_norm is not None:
             parts.append(np.dot(self.type_norm, self.type_norm[q_idx])); ws.append(self.w.w_type)
@@ -277,54 +199,43 @@ class MetaEngine:
             a = self.race_bool; q = a[q_idx]
             inter = (a & q).sum(axis=1).astype(np.float32)
             union = (a | q).sum(axis=1).astype(np.float32)
-            eps = 1e-6
-            parts.append((inter + eps) / (np.maximum(union, eps))); ws.append(self.w.w_race)
+            parts.append((inter + 1e-6) / np.maximum(union, 1e-6)); ws.append(self.w.w_race)
         elif self.race_norm is not None:
             parts.append(np.dot(self.race_norm, self.race_norm[q_idx])); ws.append(self.w.w_race)
-
         if not parts:
             return np.zeros(len(self.df), dtype=np.float32)
         W = np.array(ws, dtype=np.float32); W = W / (W.sum() + 1e-9)
-        S = np.vstack(parts).T
-        out = (S * W).sum(axis=1).astype(np.float32)
-        return np.clip(out, 0.0, 1.0)
+        return np.clip((np.vstack(parts).T * W).sum(axis=1).astype(np.float32), 0.0, 1.0)
 
-    def similarities(self, q_idx: int) -> np.ndarray:
-        s_num = self._num_sim_vec(q_idx)
-        s_cat = self._cat_sim_vec(q_idx)
-        w_cat = self.w.w_cat
-        s = (1.0 - w_cat) * s_num + w_cat * s_cat
+    def similarities(self, q_idx):
+        s = (1.0 - self.w.w_cat) * self._num_sim_vec(q_idx) + self.w.w_cat * self._cat_sim_vec(q_idx)
         return np.clip(s.astype(np.float32), 0.0, 1.0)
 
+
 # =========================================================
-# メイン推薦器（A/B 分流対応）
+# メイン推薦器
 # =========================================================
 class RecommenderV2:
     """
-    二段階召喚（候補収集）+ 融合（RRF/冪平均）+ MMR 再ランキング。
-    MetaEngine（RBF）/ BaselineEngine（Linear）を併存し，A/B 実験で切替可能。
-    """
-    def __init__(self, card_df: pd.DataFrame,
-                 art_embs: np.ndarray,
-                 lore_embs: np.ndarray,
-                 meta_embs: np.ndarray,
-                 *,
-                 use_meta_engine: bool = False,
-                 meta_engine_kwargs: dict = None):
+    二段階召喚 + 融合（RRF / power mean）+ MMR 再ランキング。
 
+    注意:
+      power_mean で p > 1 は単一モダリティの高得点を強調する。
+      複数モダリティで同時に高い候補を重視するなら 0 < p < 1 を検討する。
+    """
+
+    def __init__(self, card_df, art_embs, lore_embs, meta_embs,
+                 *, use_meta_engine=False, meta_engine_kwargs=None):
         self.db = card_df.reset_index(drop=True)
-        self.art = self._l2(art_embs)
+        self.art  = self._l2(art_embs)
         self.lore = self._l2(lore_embs)
         self.meta = self._l2(meta_embs) if meta_embs is not None else None
-
-        # A/B 用エンジン
-        self.meta_engine = None    # System B
-        self.linear_engine = None  # System A
+        self.meta_engine   = None
+        self.linear_engine = None
 
         if use_meta_engine:
             meta_engine_kwargs = meta_engine_kwargs or {}
             self.meta_engine = MetaEngine(self.db, **meta_engine_kwargs)
-            # 既に構築したカテゴリ表現を BaselineEngine に再利用
             self.linear_engine = BaselineEngine(
                 self.db,
                 level_col=meta_engine_kwargs.get("level_col", "level"),
@@ -345,188 +256,245 @@ class RecommenderV2:
                 ),
             )
 
+        if "name" not in self.db.columns:
+            raise ValueError("card_df must contain a 'name' column.")
+
         self.name2idx = pd.Series(
-            self.db.index.values,
-            index=self.db["name"].astype(str)
+            self.db.index.values, index=self.db["name"].astype(str)
         ).to_dict()
 
     @staticmethod
-    def _l2(X: np.ndarray) -> np.ndarray:
+    def _l2(X):
         X = X.astype(np.float32, copy=False)
-        n = norm(X, axis=1, keepdims=True) + 1e-9
-        return X / n
+        return X / (norm(X, axis=1, keepdims=True) + 1e-9)
 
     @staticmethod
-    def _topk_idx(sims: np.ndarray, k: int, exclude: int) -> np.ndarray:
-        k = min(k, len(sims) - 1)
-        idx = np.argpartition(-sims, k)[:k + 1]
-        idx = idx[idx != exclude]
-        return idx[np.argsort(-sims[idx])]
-
-    @staticmethod
-    def _rrf(ranks_dict: dict, k: int = 60, modality_weights: dict | None = None) -> dict[int, float]:
+    def _validate_weights(modality_weights):
         mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
-        fused = {}
+        w = np.array([mw.get("art", 1.0), mw.get("lore", 1.0), mw.get("meta", 1.0)], dtype=np.float32)
+        if not np.all(np.isfinite(w)) or np.any(w < 0):
+            raise ValueError("modality weights must be finite and non-negative.")
+        s = float(w.sum())
+        if s <= 1e-12:
+            raise ValueError("at least one modality weight must be positive.")
+        return w / s
+
+    @staticmethod
+    def _topk_idx(sims, k, exclude):
+        sims = np.asarray(sims, dtype=np.float32)
+        n = sims.shape[0]
+        if n <= 1 or k <= 0:
+            return np.empty(0, dtype=np.int64)
+        if not 0 <= exclude < n:
+            raise IndexError(f"exclude index out of range: {exclude}")
+        k_eff = min(int(k) + 1, n)
+        idx = np.argpartition(-sims, k_eff - 1)[:k_eff]
+        idx = idx[idx != exclude]
+        if idx.size == 0:
+            return idx.astype(np.int64)
+        return idx[np.argsort(-sims[idx], kind="mergesort")][:k].astype(np.int64)
+
+    @staticmethod
+    def _rrf(ranks_dict, k=60, modality_weights=None):
+        mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
+        fused: dict[int, float] = {}
         for m, ranks in ranks_dict.items():
             w = float(mw.get(m, 1.0))
             for cid, r in ranks.items():
-                fused[cid] = fused.get(cid, 0.0) + w * (1.0 / (k + r))
+                fused[cid] = fused.get(cid, 0.0) + w * (1.0 / (k + int(r)))
         return fused
 
     @staticmethod
-    def _power_mean(sim_dict: dict[str, dict[int, float]],
-                    p: float = 1.5,
-                    modality_weights: dict | None = None) -> dict[int, float]:
-        mw = modality_weights or {"art": 1.0, "lore": 1.0, "meta": 1.0}
-        fused = {}
+    def _rrf_on_pool(score_mat, pool, modality_weights=None, rrf_k=60):
+        if pool.size == 0:
+            return np.empty(0, dtype=np.float32), {}
+        w = RecommenderV2._validate_weights(modality_weights)
+        n, m = score_mat.shape
+        ranks = np.empty((n, m), dtype=np.float32)
+        for j in range(m):
+            order = np.argsort(-score_mat[:, j], kind="mergesort")
+            ranks[order, j] = np.arange(1, n + 1, dtype=np.float32)
+        fused_arr = (w[None, :] / (float(rrf_k) + ranks)).sum(axis=1).astype(np.float32)
+        return fused_arr, {int(cid): float(s) for cid, s in zip(pool, fused_arr)}
+
+    @staticmethod
+    def _power_mean(sim_dict, p=1.5, modality_weights=None):
+        if not np.isfinite(p) or p <= 0:
+            raise ValueError("p_power must be finite and > 0.")
         all_ids = set()
-        for d in sim_dict.values():
-            all_ids.update(d.keys())
-        mw_vec = np.array([mw.get("art",1.0), mw.get("lore",1.0), mw.get("meta",1.0)], dtype=np.float32)
-        mw_vec = mw_vec / (mw_vec.sum() + 1e-9)
+        for d in sim_dict.values(): all_ids.update(d.keys())
+        mw_vec = RecommenderV2._validate_weights(modality_weights)
+        fused: dict[int, float] = {}
         for cid in all_ids:
-            v_art = sim_dict.get("art", {}).get(cid, 0.0)
-            v_lor = sim_dict.get("lore", {}).get(cid, 0.0)
-            v_met = sim_dict.get("meta", {}).get(cid, 0.0)
-            v = np.array([v_art, v_lor, v_met], dtype=np.float32)
-            s = np.sum(mw_vec * (v ** p))
-            fused[cid] = float((s) ** (1.0 / p))
+            v = np.clip(np.nan_to_num(np.array([
+                sim_dict.get("art",  {}).get(cid, 0.0),
+                sim_dict.get("lore", {}).get(cid, 0.0),
+                sim_dict.get("meta", {}).get(cid, 0.0),
+            ], dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+            fused[cid] = float(np.power(np.sum(mw_vec * np.power(v, p)), 1.0 / p))
         return fused
 
     @staticmethod
-    def _minmax_on_pool(scores: np.ndarray, pool: list[int]) -> dict[int, float]:
-        if not pool:
-            return {}
-        v = scores[pool]
+    def _power_mean_on_pool(score_mat, pool, p=1.5, modality_weights=None):
+        if pool.size == 0:
+            return np.empty(0, dtype=np.float32), {}
+        if not np.isfinite(p) or p <= 0:
+            raise ValueError("p_power must be finite and > 0.")
+        w = RecommenderV2._validate_weights(modality_weights)
+        v = np.clip(np.nan_to_num(score_mat, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        fused_arr = np.power(np.sum(w[None, :] * np.power(v, p), axis=1), 1.0 / p).astype(np.float32)
+        return fused_arr, {int(cid): float(s) for cid, s in zip(pool, fused_arr)}
+
+    @staticmethod
+    def _minmax_array_on_pool(scores, pool, neutral_value=0.5):
+        if pool.size == 0:
+            return np.empty(0, dtype=np.float32)
+        v = np.nan_to_num(np.asarray(scores, dtype=np.float32)[pool], nan=0.0, posinf=0.0, neginf=0.0)
         lo, hi = float(v.min()), float(v.max())
         if hi - lo < 1e-9:
-            return {i: 0.0 for i in pool}
-        return {i: float((scores[i] - lo) / (hi - lo)) for i in pool}
+            return np.full(pool.shape[0], neutral_value, dtype=np.float32)
+        return ((v - lo) / (hi - lo)).astype(np.float32)
 
-    def _mmr_rerank(self, cand_idx: list[int], rel_scores: dict[int, float],
-                    top_n: int, lam: float) -> list[int]:
-        if not cand_idx or len(cand_idx) <= 1:
+    @staticmethod
+    def _minmax_on_pool(scores, pool):
+        pool_arr = np.asarray(pool, dtype=np.int64)
+        arr = RecommenderV2._minmax_array_on_pool(scores, pool_arr)
+        return {int(i): float(v) for i, v in zip(pool_arr, arr)}
+
+    def _mmr_rerank(self, cand_idx, rel_scores, top_n, lam):
+        if not 0.0 <= float(lam) <= 1.0:
+            raise ValueError("mmr_lambda must be in [0, 1].")
+        if top_n <= 0 or not cand_idx:
+            return []
+        if len(cand_idx) <= 1:
             return cand_idx[:top_n]
-        sub = self.art[cand_idx]
+        cand_arr = np.asarray(cand_idx, dtype=np.int64)
+        m = cand_arr.size
+        sub = self.art[cand_arr]
         sim_mat = np.dot(sub, sub.T).astype(np.float32)
         np.fill_diagonal(sim_mat, 0.0)
-        selected = []
-        remaining = list(range(len(cand_idx)))
-        rel_vec_all = np.array([rel_scores.get(cand_idx[i], 0.0) for i in range(len(cand_idx))], dtype=np.float32)
-        first = int(np.argmax(rel_vec_all[remaining]))
-        selected.append(remaining.pop(first))
-        while len(selected) < min(top_n, len(cand_idx)) and remaining:
-            penal = sim_mat[remaining][:, selected].max(axis=1)
-            rel_now = rel_vec_all[remaining]
-            mmr = lam * rel_now - (1.0 - lam) * penal
-            nxt_local = int(np.argmax(mmr))
-            selected.append(remaining.pop(nxt_local))
-        return [cand_idx[i] for i in selected]
+        rel_vec = np.nan_to_num(
+            np.array([rel_scores.get(int(c), 0.0) for c in cand_arr], dtype=np.float32),
+            nan=0.0, posinf=0.0, neginf=0.0
+        )
+        selected: list[int] = []
+        available = np.ones(m, dtype=bool)
+        first = int(np.argmax(rel_vec))
+        selected.append(first); available[first] = False
+        max_penalty = sim_mat[:, first].copy()
+        limit = min(int(top_n), m)
+        while len(selected) < limit and available.any():
+            mmr = float(lam) * rel_vec - (1.0 - float(lam)) * max_penalty
+            mmr[~available] = -np.inf
+            nxt = int(np.argmax(mmr))
+            selected.append(nxt); available[nxt] = False
+            max_penalty = np.maximum(max_penalty, sim_mat[:, nxt])
+        return cand_arr[selected].astype(int).tolist()
 
-    def recommend(self, query_name: str,
-                  top_n: int = 12,
-                  k_each: int = 150,
-                  fusion: str = "rrf",
-                  p_power: float = 1.5,
-                  use_mmr: bool = True,
-                  mmr_lambda: float = 0.7,
-                  w_art: float = 1.0,
-                  w_lore: float = 1.0,
-                  w_meta: float = 1.0,
-                  ab_system: str = "B"  # "A"=Baseline（Linear）, "B"=Proposed（RBF）
-                  ) -> pd.DataFrame:
-
+    def recommend(self, query_name, top_n=12, k_each=150, fusion="rrf",
+                  p_power=1.5, use_mmr=True, mmr_lambda=0.7,
+                  w_art=1.0, w_lore=1.0, w_meta=1.0, ab_system="B"):
         if query_name not in self.name2idx:
             raise ValueError(f"Card '{query_name}' not found.")
-        q = self.name2idx[query_name]
+        if top_n <= 0:
+            return self.db.iloc[[]].copy()
+        if k_each <= 0:
+            raise ValueError("k_each must be positive.")
 
-        # 画像・テキスト類似（共通）
+        fusion_key = (fusion or "rrf").lower()
+        if fusion_key not in {"rrf", "power_mean", "power"}:
+            raise ValueError("fusion must be 'rrf' or 'power_mean'.")
+
+        ab_key = (ab_system or "B").upper()[0]
+        if ab_key not in {"A", "B"}:
+            raise ValueError("ab_system must be 'A' or 'B'.")
+
+        q = self.name2idx[query_name]
         art_s  = np.dot(self.art,  self.art[q]).astype(np.float32)
         lore_s = np.dot(self.lore, self.lore[q]).astype(np.float32)
 
-        # ---------- A/B 切替（数値知覚モデリングの実験変数） ----------
-        # System A: Linear Normalization + Cosine（対照）
-        # System B: Non-linear Perception Mapping with Gaussian Kernel（提案）
-        if (ab_system or "B").upper().startswith("A"):
-            if self.linear_engine is not None:
-                meta_s = self.linear_engine.similarities(q)
-            else:
-                meta_s = np.dot(self.meta, self.meta[q]).astype(np.float32) if self.meta is not None else \
-                         np.zeros(len(self.db), dtype=np.float32)
+        if ab_key == "A":
+            if self.linear_engine is None:
+                raise RuntimeError("System A requires use_meta_engine=True.")
+            meta_s = self.linear_engine.similarities(q)
         else:
-            if self.meta_engine is not None:
-                meta_s = self.meta_engine.similarities(q)
-            else:
-                meta_s = np.dot(self.meta, self.meta[q]).astype(np.float32) if self.meta is not None else \
-                         np.zeros(len(self.db), dtype=np.float32)
+            if self.meta_engine is None:
+                raise RuntimeError("System B requires use_meta_engine=True.")
+            meta_s = self.meta_engine.similarities(q)
 
-        # 候補集合
         art_c  = self._topk_idx(art_s,  k_each, q)
         lore_c = self._topk_idx(lore_s, k_each, q)
         meta_c = self._topk_idx(meta_s, k_each, q)
-        pool = list(set(art_c) | set(lore_c) | set(meta_c))
+        pool = np.union1d(np.union1d(art_c, lore_c), meta_c).astype(np.int64)
 
-        # 融合（RRF / 冪平均）
+        if pool.size == 0:
+            return self.db.iloc[[]].copy()
+
         mw = {"art": w_art, "lore": w_lore, "meta": w_meta}
-        if fusion == "rrf":
-            def ranks_from(scores: np.ndarray) -> dict[int, int]:
-                return {cid: r + 1 for r, cid in enumerate(sorted(pool, key=lambda i: -scores[i]))}
-            fused = self._rrf({"art": ranks_from(art_s),
-                               "lore": ranks_from(lore_s),
-                               "meta": ranks_from(meta_s)}, modality_weights=mw)
-        else:
-            fused = self._power_mean({
-                "art":  self._minmax_on_pool(art_s,  pool),
-                "lore": self._minmax_on_pool(lore_s, pool),
-                "meta": self._minmax_on_pool(meta_s, pool),
-            }, p=p_power, modality_weights=mw)
 
-        pre = sorted(pool, key=lambda i: -fused.get(i, 0.0))
-        final_idx = self._mmr_rerank(pre[:3 * top_n], fused, top_n, mmr_lambda) if use_mmr else pre[:top_n]
+        if fusion_key == "rrf":
+            score_mat = np.column_stack([art_s[pool], lore_s[pool], meta_s[pool]]).astype(np.float32)
+            fused_arr, fused = self._rrf_on_pool(score_mat, pool, modality_weights=mw)
+        else:
+            score_mat = np.column_stack([
+                self._minmax_array_on_pool(art_s,  pool),
+                self._minmax_array_on_pool(lore_s, pool),
+                self._minmax_array_on_pool(meta_s, pool),
+            ]).astype(np.float32)
+            fused_arr, fused = self._power_mean_on_pool(score_mat, pool, p=p_power, modality_weights=mw)
+
+        order = np.argsort(-fused_arr, kind="mergesort")
+        pre = pool[order].astype(int).tolist()
+        mmr_pool_size = min(len(pre), max(top_n, 3 * top_n))
+
+        if use_mmr:
+            final_idx = self._mmr_rerank(pre[:mmr_pool_size], fused, top_n, mmr_lambda)
+        else:
+            final_idx = pre[:top_n]
 
         out = self.db.iloc[final_idx].copy()
-        out["art_sim"]     = [float(art_s[i]) for i in final_idx]
-        out["lore_sim"]    = [float(lore_s[i]) for i in final_idx]
-        out["meta_sim"]    = [float(meta_s[i]) for i in final_idx]
-        out["final_score"] = [float(fused.get(i, 0.0)) for i in final_idx]
+        final_arr = np.asarray(final_idx, dtype=np.int64)
+        out["art_sim"]     = art_s[final_arr].astype(float)
+        out["lore_sim"]    = lore_s[final_arr].astype(float)
+        out["meta_sim"]    = meta_s[final_arr].astype(float)
+        out["final_score"] = [float(fused.get(int(i), 0.0)) for i in final_idx]
+
+        out.attrs["recommend_config"] = {
+            "ab_system": ab_key,
+            "fusion": "power_mean" if fusion_key == "power" else fusion_key,
+            "p_power": float(p_power), "use_mmr": bool(use_mmr),
+            "mmr_lambda": float(mmr_lambda), "k_each": int(k_each), "top_n": int(top_n),
+            "weights": {"art": float(w_art), "lore": float(w_lore), "meta": float(w_meta)},
+        }
         return out
 
-    # -------- デバッグ：数値/カテゴリ/統合の分解 --------
-    def debug_meta_components(self, query_name: str, rank: int = 0):
+    def debug_meta_components(self, query_name, rank=0):
         if query_name not in self.name2idx:
             raise ValueError(f"Card '{query_name}' not found.")
         if self.meta_engine is None:
-            print("[DEBUG] MetaEngine disabled.")
-            return None
+            print("[DEBUG] MetaEngine disabled."); return None
         q = self.name2idx[query_name]
         art_s  = np.dot(self.art,  self.art[q]).astype(np.float32)
         lore_s = np.dot(self.lore, self.lore[q]).astype(np.float32)
         meta_s = self.meta_engine.similarities(q)
-        k_each = 150
-        art_c  = self._topk_idx(art_s,  k_each, q)
-        lore_c = self._topk_idx(lore_s, k_each, q)
-        meta_c = self._topk_idx(meta_s, k_each, q)
-        pool   = list(set(art_c) | set(lore_c) | set(meta_c))
-        pre = sorted(pool, key=lambda i: -meta_s[i])
+        pool = np.union1d(np.union1d(
+            self._topk_idx(art_s, 150, q),
+            self._topk_idx(lore_s, 150, q)),
+            self._topk_idx(meta_s, 150, q))
+        pre = pool[np.argsort(-meta_s[pool], kind="mergesort")]
         if rank >= len(pre):
             raise ValueError(f"rank {rank} >= pool size {len(pre)}")
-        i = pre[rank]
-        s_num  = float(self.meta_engine._num_sim_vec(q)[i])
-        s_cat  = float(self.meta_engine._cat_sim_vec(q)[i])
-        s_meta = float(meta_s[i])
-        return {"q": int(q), "i": int(i), "name": str(self.db.iloc[i]["name"]),
-                "s_num": s_num, "s_cat": s_cat, "s_meta": s_meta,
+        i = int(pre[rank])
+        return {"q": int(q), "i": i, "name": str(self.db.iloc[i]["name"]),
+                "s_num": float(self.meta_engine._num_sim_vec(q)[i]),
+                "s_cat": float(self.meta_engine._cat_sim_vec(q)[i]),
+                "s_meta": float(meta_s[i]),
                 "sigma": self.meta_engine.sigma.copy()}
 
-    # -------- Hugging Face データセットからロード --------
     @classmethod
-    def from_hf(cls, repo_id: str,
-                *,
-                use_meta_engine: bool = False,
-                meta_engine_kwargs: dict = None):
+    def from_hf(cls, repo_id, *, use_meta_engine=False, meta_engine_kwargs=None):
         local_dir = Path(snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
+            repo_id=repo_id, repo_type="dataset",
             allow_patterns=["*.parquet", "*.npz"]
         ))
         df   = pd.read_parquet(local_dir / "card_database.parquet")
