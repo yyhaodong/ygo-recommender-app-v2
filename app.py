@@ -342,14 +342,63 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
 
 def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
     """
-    結果一覧を「n_cols 列グリッド」で表示する。
-    - 画像は use_container_width/use_column_width の後方互換で列幅に自動フィット
-    - 4 列固定が“正攻法”。スクリーンショット用途にも安定。
+    レスポンシブ CSS grid で結果を表示する。
+    スマホ: 2列, タブレット: 3列, PC: 4列以上に自動調整。
     """
-    cols = st.columns(n_cols, gap="small")
-    for i, (_, row) in enumerate(results_df.iterrows()):
-        with cols[i % n_cols]:
-            render_card_compact(row)
+    st.markdown("""
+    <style>
+    .ygo-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 12px;
+        width: 100%;
+    }
+    .ygo-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        background: #1a1a2e;
+        border-radius: 8px;
+        padding: 8px;
+        border: 1px solid #333;
+    }
+    .ygo-card img {
+        width: 100%;
+        height: auto;
+        border-radius: 4px;
+    }
+    .ygo-card-name {
+        font-size: 12px;
+        text-align: center;
+        margin-top: 6px;
+        color: #eee;
+        word-break: break-word;
+    }
+    @media (max-width: 480px) {
+        .ygo-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    cards_html = '<div class="ygo-grid">'
+    for _, row in results_df.iterrows():
+        d = row.to_dict()
+        name = str(d.get(COL_NAME, "Unknown"))
+        img_url = image_url_for_row(row) or ""
+        img_tag = f'<img src="{img_url}" alt="{name}">' if img_url else ""
+        cards_html += f'<div class="ygo-card">{img_tag}<div class="ygo-card-name">{name}</div></div>'
+    cards_html += '</div>'
+    st.markdown(cards_html, unsafe_allow_html=True)
+
+    with st.expander("📋 全結果の詳細スコアを見る", expanded=False):
+        for _, row in results_df.iterrows():
+            d = row.to_dict()
+            st.markdown(f"**{d.get(COL_NAME, 'Unknown')}**")
+            similarity_bar("🖼️ 画像類似度",      d.get("art_sim", 0.0),    "絵柄・色味などの近さ")
+            similarity_bar("📖 テキスト類似度",   d.get("lore_sim", 0.0),   "効果テキストの意味の近さ")
+            similarity_bar("🔢 メタデータ類似度", d.get("meta_sim", 0.0),   "種別・ATK/DEF 等の一致度")
+            similarity_bar("⭐ 総合スコア",       d.get("final_score", 0.0), "上記を融合した最終評価")
+            st.divider()
 
 # =========================
 # A/B 横断の通知バナー
