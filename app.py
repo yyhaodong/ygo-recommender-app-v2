@@ -127,9 +127,10 @@ def get_recommender():
                 w_type=0.50, w_attr=0.25, w_race=0.25
             ),
             # ゲーム単位スケーリング + σ 下限（縮尺空間）
-            units=(1.0, 100.0, 100.0),   # Level=1, ATK/DEF=100
+            # グリッドサーチ最優パラメータ（R_arch=0.3304, R_all=0.2575）
+            units=(2.0, 50.0, 50.0),     # Level=2, ATK/DEF=50
             min_sigma=(1.0, 3.0, 3.0),  # 1級 / 300 ATK / 300 DEF
-            sigma_scale=1.0
+            sigma_scale=2.5
         )
     )
 
