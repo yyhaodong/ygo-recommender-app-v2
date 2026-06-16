@@ -37,22 +37,15 @@ if os.path.exists("clip_config.json"):
 # 画像表示ユーティリティ（後方互換）
 # =========================
 def _img_fit(image_obj, *, caption=None):
-    """Streamlitのバージョン差を吸収しつつ、列幅にフィットして画像を表示する。"""
     try:
-        # 新しめのStreamlit
         st.image(image_obj, caption=caption, use_container_width=True)
     except TypeError as e:
-        # 古いStreamlitは use_container_width を受け付けない
         if "use_container_width" in str(e):
             st.image(image_obj, caption=caption, use_column_width=True)
         else:
             raise
 
-# =========================
-# 画像表示（URL優先）
-# =========================
 def show_image_url(value: str | None, *, caption=None):
-    """列幅いっぱいに画像を自動フィットさせる（レスポンシブ）。"""
     if not value:
         st.write("—")
         return
@@ -61,7 +54,7 @@ def show_image_url(value: str | None, *, caption=None):
         if url.startswith(("http://", "https://")):
             r = requests.get(url, timeout=8)
             r.raise_for_status()
-            _img_fit(BytesIO(r.content), caption=caption)  # 後方互換ハンドラ経由
+            _img_fit(BytesIO(r.content), caption=caption)
         else:
             st.warning("画像URLが無効です（ローカルパス検出）。")
             st.caption(url)
@@ -71,7 +64,6 @@ def show_image_url(value: str | None, *, caption=None):
         st.caption(f"→ {e}")
 
 def safe_columns(n: int):
-    """古いコード互換（不要なら未使用でOK）。"""
     try: n = int(n or 1)
     except Exception: n = 1
     return st.columns(max(1, min(n, 6)), gap="small")
@@ -85,7 +77,6 @@ def pill(text: str):
 
 def fmt(v): return "-" if pd.isna(v) else str(v)
 
-# 表示の丸め修正：1.0 のみ 100%、それ以外は切り捨て整数％
 def similarity_bar(label: str, value: float, note: str=""):
     try:
         v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
@@ -110,15 +101,10 @@ st.title("🔮 遊戯王カード 多モーダル推薦エンジン")
 
 @st.cache_resource(show_spinner="推薦エンジンとデータを読み込み中…")
 def get_recommender():
-    """
-    RecommenderV2 を Hugging Face データセットから構築。
-    - MetaEngine を有効化（System B の数値カーネル用）
-    - Baseline（System A）は meta 埋め込みのコサインにフォールバック
-    """
     from recommender_v2 import RecommenderV2, MetaWeights
     return RecommenderV2.from_hf(
         "oneonehaodong/ygo-recommender-data",
-        use_meta_engine=True,  # B で使用
+        use_meta_engine=True,
         meta_engine_kwargs=dict(
             level_col="level", atk_col="atk", def_col="def",
             type_col="type", attribute_col="attribute", race_col="race",
@@ -126,10 +112,8 @@ def get_recommender():
                 w_cat=0.40, w_level=0.30, w_atk=0.15, w_def=0.15,
                 w_type=0.50, w_attr=0.25, w_race=0.25
             ),
-            # ゲーム単位スケーリング + σ 下限（縮尺空間）
-            # グリッドサーチ最優パラメータ（R_arch=0.3304, R_all=0.2575）
-            units=(2.0, 50.0, 50.0),     # Level=2, ATK/DEF=50
-            min_sigma=(1.0, 3.0, 3.0),  # 1級 / 300 ATK / 300 DEF
+            units=(2.0, 50.0, 50.0),
+            min_sigma=(1.0, 3.0, 3.0),
             sigma_scale=2.5
         )
     )
@@ -137,7 +121,6 @@ def get_recommender():
 rec = get_recommender()
 DF: pd.DataFrame = rec.db.copy()
 
-# 実行時に画像URL作成（既存URL列 → 数字IDで YGOPRO）
 def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
     for col in ["image_url", "img_url", "thumbnail_url", "card_image_url", "url"]:
         if col in df.columns:
@@ -157,7 +140,6 @@ def make_runtime_image_url(df: pd.DataFrame) -> pd.Series:
 
 DF["image_url_runtime"] = make_runtime_image_url(DF)
 
-# 列名フォールバック
 COL_NAME  = "name" if "name" in DF.columns else DF.columns[0]
 COL_TYPE  = next((c for c in ["type", "card_type", "race", "frameType"] if c in DF.columns), None)
 COL_ATK   = next((c for c in ["atk", "ATK"] if c in DF.columns), None)
@@ -167,7 +149,6 @@ COL_DESC  = next((c for c in ["desc", "effect", "text"] if c in DF.columns), Non
 COL_ID    = next((c for c in ["id", "passcode", "konami_id", "code"] if c in DF.columns), None)
 
 def image_url_for_row(row: pd.Series) -> str | None:
-    """画像URLを安全に取得（YGOPROのID補完を含む）。"""
     url_rt = row.get("image_url_runtime", None)
     if pd.notna(url_rt) and isinstance(url_rt, (str, bytes)) and str(url_rt):
         return str(url_rt)
@@ -180,7 +161,7 @@ def image_url_for_row(row: pd.Series) -> str | None:
     return None
 
 # =========================
-# CLIP エンコーダ（未導入でも名称検索は動く）
+# CLIP エンコーダ
 # =========================
 ENCODER_OK = False
 try:
@@ -198,7 +179,6 @@ except Exception:
     ENCODER_OK = False
 
 def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
-    """PIL 画像を CLIP ベクトルへ変換（L2 正規化）。"""
     if not ENCODER_OK:
         raise RuntimeError("Image encoder not available.")
     with torch.no_grad():
@@ -208,14 +188,20 @@ def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
         return feat.cpu().numpy()[0].astype(np.float32)
 
 def nearest_card_by_art(rec_obj, v: np.ndarray) -> Tuple[int, str, float]:
-    """
-    画像ベクトル v と rec.art のコサインで最も近いカードを返す。
-    - RecommenderV2 に専用APIが無い場合のフォールバック。
-    """
     sims = np.dot(rec_obj.art, v.astype(np.float32))
     i = int(np.argmax(sims))
     name = str(rec_obj.db.iloc[i]["name"])
     return i, name, float(sims[i])
+
+def encode_text_to_vec(text: str) -> np.ndarray:
+    if not ENCODER_OK:
+        raise RuntimeError("CLIP not available.")
+    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    with torch.no_grad():
+        tokens = tokenizer([text])
+        feat = model_clip.encode_text(tokens)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+    return feat.cpu().numpy().astype(np.float32)[0]
 
 # =========================
 # サイドバー（A/B 切替・検索入力・高度設定）
@@ -242,24 +228,18 @@ with st.sidebar:
         query = st.selectbox("カード名を選択", options=names)
 
     with tab_text:
-        st.caption("英語で抽象的なキーワードを入力してください。例: cute girl magician、dragon with blue eyes")
+        st.caption("英語でキーワードを入力")
         text_query = st.text_input("🔍 フリーテキスト検索", placeholder="e.g. cute girl magician")
         n_text_candidates = st.slider("候補カード数", 3, 10, 5, 1)
-        text_search_button = st.button("🔍 テキストで候補を探す", use_container_width=True)
+        text_search_button = st.button("🔍 候補を探す", use_container_width=True)
 
         if text_search_button and text_query.strip():
             if not ENCODER_OK:
-                st.error("CLIP モデルが未ロードのため、テキスト検索は使用できません。")
+                st.error("CLIP が未ロードです。")
             else:
-                with st.spinner("テキストからカードを検索中…"):
+                with st.spinner("検索中…"):
                     try:
-                        import open_clip
-                        tokenizer = open_clip.get_tokenizer(MODEL_NAME)
-                        with torch.no_grad():
-                            tokens = tokenizer([text_query])
-                            text_feat = model_clip.encode_text(tokens)
-                            text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
-                        text_vec = text_feat.cpu().numpy().astype(np.float32)[0]
+                        text_vec = encode_text_to_vec(text_query)
                         sims = np.dot(rec.art, text_vec)
                         top_idx = np.argsort(-sims)[:n_text_candidates]
                         candidates_df = rec.db.iloc[top_idx].copy()
@@ -267,40 +247,23 @@ with st.sidebar:
                         candidates_df = candidates_df.join(DF["image_url_runtime"], how="left")
                         st.session_state["text_candidates"] = candidates_df
                         st.session_state["text_query_used"] = text_query
-                    except Exception as e:
-                        st.error(f"テキスト検索エラー：{e}")
-
-        # 候補カードを表示して選択させる
-        if "text_candidates" in st.session_state:
-            cands = st.session_state["text_candidates"]
-            st.markdown(f"**「{st.session_state.get('text_query_used', '')}」の候補カード — クリックして選択**")
-            for i, (_, row) in enumerate(cands.iterrows()):
-                card_name = str(row[COL_NAME])
-                img_url = image_url_for_row(row) or ""
-                sim_pct = int(float(row["text_sim"]) * 100)
-                col_img, col_info = st.columns([1, 3])
-                with col_img:
-                    if img_url:
-                        show_image_url(img_url)
-                with col_info:
-                    st.markdown(f"**{card_name}**")
-                    st.caption(f"テキスト類似度: {sim_pct}%")
-                    if st.button(f"✅ これを選択", key=f"text_sel_{i}"):
-                        st.session_state["text_selected_card"] = card_name
+                        # 候補が新しく来たら選択をリセット
+                        if "text_selected_card" in st.session_state:
+                            del st.session_state["text_selected_card"]
                         st.rerun()
-                st.divider()
+                    except Exception as e:
+                        st.error(f"エラー：{e}")
 
-        # 選択済みカードを表示
         if "text_selected_card" in st.session_state:
             selected = st.session_state["text_selected_card"]
-            st.success(f"🎯 選択中のカード：**{selected}**")
+            st.success(f"🎯 選択中：**{selected}**")
             if st.button("❌ 選択を解除", key="text_clear"):
                 del st.session_state["text_selected_card"]
-                del st.session_state["text_candidates"]
+                if "text_candidates" in st.session_state:
+                    del st.session_state["text_candidates"]
                 st.rerun()
 
     with tab_image:
-        # いつでもアップロード表示（エンコーダ有無に依存しない）
         up = st.file_uploader("画像をアップロード", type=["jpg","jpeg","png","webp","gif","heic","heif"])
         url = st.text_input("または画像URLを貼り付け")
         pil = None
@@ -317,12 +280,12 @@ with st.sidebar:
                 st.error(f"画像URLの取得に失敗しました：{e}")
 
         if pil is not None:
-            _img_fit(pil, caption="クエリ画像プレビュー")  # 後方互換
+            _img_fit(pil, caption="クエリ画像プレビュー")
             if ENCODER_OK:
                 with st.spinner("画像特徴を抽出中…"):
                     try:
                         v = encode_pil_to_vec(pil)
-                        idx, nn_name, sim = nearest_card_by_art(rec, v)  # フォールバック近傍検索
+                        idx, nn_name, sim = nearest_card_by_art(rec, v)
                         effective_query_name = nn_name
                         st.success(f"最も近いカード：**{nn_name}**（sim={sim:.3f}）")
                     except Exception as e:
@@ -336,7 +299,7 @@ with st.sidebar:
             if cam is not None:
                 try:
                     pil = Image.open(cam)
-                    _img_fit(pil, caption="カメラ画像プレビュー")  # 後方互換
+                    _img_fit(pil, caption="カメラ画像プレビュー")
                     with st.spinner("画像特徴を抽出中…"):
                         v = encode_pil_to_vec(pil)
                         idx, nn_name, sim = nearest_card_by_art(rec, v)
@@ -347,7 +310,6 @@ with st.sidebar:
         else:
             st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
-    # テキスト検索で選択されたカードを優先
     if not effective_query_name:
         effective_query_name = st.session_state.get("text_selected_card") or query or None
 
@@ -355,7 +317,7 @@ with st.sidebar:
         topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
         fusion  = st.selectbox("融合方式", ["rrf", "power_mean"], index=0,
                                help="RRF：スコア尺度に頑健。power_mean：複数モダリティ同時高得点を優遇。")
-        p_power = st.slider("冪平均 p（>1 ほど“同時に高得点”を優遇）", 1.0, 3.0, 1.5, 0.1,
+        p_power = st.slider("冪平均 p（>1 ほど 同時に高得点 を優遇）", 1.0, 3.0, 1.5, 0.1,
                             disabled=(fusion != "power_mean"))
         k_each     = st.slider("各モダリティの候補数 k_each", 50, 400, 150, 10)
         use_mmr    = st.checkbox("MMR による多様性再ランキングを使用", True)
@@ -370,58 +332,21 @@ with st.sidebar:
 # =========================
 def render_card_full(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
-    # モバイル対応：画像を小さく固定し、横並びレイアウト
     img_url = image_url_for_row(row) or ""
     name = str(d.get(COL_NAME, "Unknown"))
     desc = d.get(COL_DESC) or "—"
     type_v = fmt(d.get(COL_TYPE))
     atk_v  = fmt(d.get(COL_ATK))
     def_v  = fmt(d.get(COL_DEF))
-    st.markdown(f"""
-    <style>
-    .base-card {{
-        display: flex;
-        flex-direction: row;
-        gap: 12px;
-        align-items: flex-start;
-        margin-bottom: 8px;
-    }}
-    .base-card img {{
-        width: 100px;
-        min-width: 100px;
-        height: auto;
-        border-radius: 6px;
-    }}
-    .base-card-info {{
-        flex: 1;
-        min-width: 0;
-    }}
-    .base-card-info h3 {{
-        margin: 0 0 6px 0;
-        font-size: 16px;
-    }}
-    .base-card-meta {{
-        font-size: 12px;
-        color: #aaa;
-        margin-bottom: 6px;
-    }}
-    .base-card-desc {{
-        font-size: 12px;
-        line-height: 1.5;
-        color: #ddd;
-        max-height: 120px;
-        overflow-y: auto;
-    }}
-    </style>
-    <div class="base-card">
-        <img src="{img_url}" alt="{name}">
-        <div class="base-card-info">
-            <h3>{name}</h3>
-            <div class="base-card-meta">種別: {type_v} | ATK: {atk_v} | DEF: {def_v}</div>
-            <div class="base-card-desc">{desc}</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    col_img, col_info = st.columns([1, 3])
+    with col_img:
+        if img_url:
+            show_image_url(img_url)
+    with col_info:
+        st.markdown(f"### {name}")
+        st.caption(f"種別: {type_v} | ATK: {atk_v} | DEF: {def_v}")
+        if COL_DESC:
+            st.write(desc)
 
 def render_card_compact(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
@@ -440,10 +365,6 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
             st.write(d.get(COL_DESC) or "—")
 
 def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
-    """
-    レスポンシブ CSS grid で結果を表示する。
-    スマホ: 2列, タブレット: 3列, PC: 4列以上に自動調整。
-    """
     st.markdown("""
     <style>
     .ygo-grid {
@@ -500,14 +421,14 @@ def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
             st.divider()
 
 # =========================
-# A/B 横断の通知バナー
+# A/B 通知バナー
 # =========================
 if ab_system == "A":
     st.info("🧪 現在テスト中：System A（Baseline: Min-Max + Cosine）", icon="🧪")
 else:
     st.success("🧪 現在テスト中：System B（Proposed: Gaussian Kernel）", icon="🧪")
 
-# デバッグ（任意）
+# デバッグ
 if debug:
     http_ok = DF["image_url_runtime"].astype(str).str.startswith(("http://","https://"), na=False).sum()
     st.info("🔧 デバッグ情報")
@@ -519,16 +440,40 @@ if debug:
     st.dataframe(DF[[COL_NAME, "image_url_runtime"]].head(10))
 
 # =========================
-# メイン処理（A/B 切替はメタ経路の切換で実装）
+# ★ テキスト検索の候補を主画面に表示
+# =========================
+if "text_candidates" in st.session_state and "text_selected_card" not in st.session_state:
+    cands = st.session_state["text_candidates"]
+    used_q = st.session_state.get("text_query_used", "")
+    st.subheader(f"🔍「{used_q}」の候補カード")
+    st.caption("カードをクリックして選択すると、そのカードを基準に推薦します")
+
+    cols = st.columns(len(cands))
+    for i, (col, (_, row)) in enumerate(zip(cols, cands.iterrows())):
+        with col:
+            card_name = str(row[COL_NAME])
+            img_url = image_url_for_row(row) or ""
+            sim_pct = int(float(row["text_sim"]) * 100)
+            if img_url:
+                show_image_url(img_url)
+            st.caption(f"**{card_name}**")
+            st.caption(f"類似度: {sim_pct}%")
+            if st.button("✅ 選択", key=f"main_sel_{i}", use_container_width=True):
+                st.session_state["text_selected_card"] = card_name
+                st.rerun()
+
+    st.divider()
+
+# =========================
+# メイン処理
 # =========================
 if fire:
     if not effective_query_name:
         st.warning("基準となるカード（または画像）を選んでください。")
     else:
-        # テキスト検索経由の場合、元のクエリを表示
         if st.session_state.get("text_selected_card") == effective_query_name:
             used_query = st.session_state.get("text_query_used", "")
-            st.info(f"💬 テキスト検索「**{used_query}**」から選択されたカードで推薦します")
+            st.info(f"💬 テキスト検索「**{used_query}**」→ **{effective_query_name}** で推薦します")
 
         base_df = DF[DF[COL_NAME] == effective_query_name]
         if len(base_df):
@@ -538,14 +483,11 @@ if fire:
 
         with st.spinner("計算中…"):
             try:
-                # --- A/B の切替：
-                # RecommenderV2.recommend の実装に ab_system 引数が無くても動くよう
-                # meta_engine の有効/無効を一時的に切り替えて制御する。
                 _saved_engine = rec.meta_engine
                 if ab_system == "A":
-                    rec.meta_engine = None  # Baseline: メタは埋め込みのコサイン
+                    rec.meta_engine = None
                 else:
-                    rec.meta_engine = _saved_engine  # Proposed: MetaEngine（RBF/Gaussian）
+                    rec.meta_engine = _saved_engine
 
                 results: pd.DataFrame = rec.recommend(
                     query_name=effective_query_name,
@@ -558,7 +500,6 @@ if fire:
                 st.exception(e)
                 results = None
             finally:
-                # インスタンスを元の状態に戻す（再実行の整合性を保つ）
                 rec.meta_engine = _saved_engine
 
         if results is not None and len(results):
@@ -571,15 +512,14 @@ if fire:
             else:
                 render_results_grid(results, n_cols=4)
 
-            # ---- 開発者向け：Meta の分解（B の理解補助）----
             with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
                 st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
                 if rec.meta_engine is not None:
                     st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
                 else:
                     st.caption("Baseline（System A）ではメタは埋め込みコサインで計算。")
-            # --------------------------------------------------
         else:
             st.info("該当する結果がありません。")
 else:
-    st.info("左側でカード名を選ぶか、画像/カメラで検索して「🔮 検索」を押してください。")
+    if "text_candidates" not in st.session_state:
+        st.info("左側でカード名を選ぶか、テキスト/画像/カメラで検索して「🔮 検索」を押してください。")
