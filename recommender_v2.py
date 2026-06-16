@@ -218,11 +218,12 @@ class MetaEngine:
 class RecommenderV2:
     """
     二段階召喚 + 融合（RRF / power mean）+ MMR 再ランキング。
-
-    注意:
-      power_mean で p > 1 は単一モダリティの高得点を強調する。
-      複数モダリティで同時に高い候補を重視するなら 0 < p < 1 を検討する。
+    + search_by_text: 自由テキストからカードを検索する新機能。
     """
+
+    # CLIP model name (detected by detect_clip_model.py)
+    _CLIP_MODEL_NAME = "ViT-B-32"
+    _CLIP_PRETRAINED = "openai"
 
     def __init__(self, card_df, art_embs, lore_embs, meta_embs,
                  *, use_meta_engine=False, meta_engine_kwargs=None):
@@ -232,6 +233,10 @@ class RecommenderV2:
         self.meta = self._l2(meta_embs) if meta_embs is not None else None
         self.meta_engine   = None
         self.linear_engine = None
+
+        # CLIP model (lazy-loaded on first call to search_by_text)
+        self._clip_model = None
+        self._clip_tokenizer = None
 
         if use_meta_engine:
             meta_engine_kwargs = meta_engine_kwargs or {}
@@ -263,6 +268,99 @@ class RecommenderV2:
             self.db.index.values, index=self.db["name"].astype(str)
         ).to_dict()
 
+    # ---------------------------------------------------------
+    # ★ 新機能: 自由テキスト → カード検索
+    # ---------------------------------------------------------
+    def _load_clip(self):
+        """CLIPモデルを遅延ロード（初回呼び出し時のみ）"""
+        if self._clip_model is not None:
+            return
+        try:
+            import torch
+            import open_clip
+        except ImportError:
+            raise ImportError("open_clip が必要です: pip install open-clip-torch")
+
+        print(f"[CLIP] Loading {self._CLIP_MODEL_NAME} / {self._CLIP_PRETRAINED} ...")
+        model, _, _ = open_clip.create_model_and_transforms(
+            self._CLIP_MODEL_NAME, pretrained=self._CLIP_PRETRAINED
+        )
+        model.eval()
+        self._clip_model = model
+        self._clip_tokenizer = open_clip.get_tokenizer(self._CLIP_MODEL_NAME)
+        self._torch = torch
+        print("[CLIP] Model loaded.")
+
+    def search_by_text(self, query: str, top_n: int = 5) -> pd.DataFrame:
+        """
+        自由テキストで最も近いカードを返す。
+        結果の先頭カード名を recommend() に渡せばそのまま推薦に使える。
+
+        Parameters
+        ----------
+        query  : 検索クエリ（英語推奨）例: "cute girl magician"
+        top_n  : 返すカード数
+
+        Returns
+        -------
+        DataFrame with columns [...card columns..., 'text_sim']
+        """
+        if not query or not query.strip():
+            raise ValueError("query must not be empty.")
+        if top_n <= 0:
+            raise ValueError("top_n must be positive.")
+
+        self._load_clip()
+
+        with self._torch.no_grad():
+            tokens = self._clip_tokenizer([query])
+            text_feat = self._clip_model.encode_text(tokens)
+            text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+
+        text_vec = text_feat.cpu().numpy().astype(np.float32)[0]
+
+        # art_embs はすでに L2 正規化済み → 内積 = コサイン類似度
+        sims = np.dot(self.art, text_vec)
+
+        top_idx = np.argsort(-sims)[:top_n].astype(np.int64)
+        result = self.db.iloc[top_idx].copy()
+        result["text_sim"] = sims[top_idx].astype(float)
+        return result
+
+    def search_and_recommend(self, query: str, top_n: int = 12,
+                             n_candidates: int = 5, **recommend_kwargs) -> dict:
+        """
+        テキスト検索 → 上位1件を基準カードとして推薦まで一気に実行。
+
+        Parameters
+        ----------
+        query          : 自由テキスト（英語）
+        top_n          : 最終推薦件数
+        n_candidates   : テキスト検索で候補として表示するカード数
+        recommend_kwargs: recommend() に渡す追加引数
+
+        Returns
+        -------
+        {
+          "query":      入力テキスト,
+          "candidates": テキスト検索の候補 DataFrame,
+          "pivot":      推薦の基準カード名,
+          "results":    推薦結果 DataFrame
+        }
+        """
+        candidates = self.search_by_text(query, top_n=n_candidates)
+        pivot_name = str(candidates.iloc[0]["name"])
+        results = self.recommend(pivot_name, top_n=top_n, **recommend_kwargs)
+        return {
+            "query":      query,
+            "candidates": candidates,
+            "pivot":      pivot_name,
+            "results":    results,
+        }
+
+    # ---------------------------------------------------------
+    # 既存メソッド（変更なし）
+    # ---------------------------------------------------------
     @staticmethod
     def _l2(X):
         X = X.astype(np.float32, copy=False)

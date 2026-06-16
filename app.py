@@ -233,13 +233,71 @@ with st.sidebar:
     ab_system = "B" if ab_label.startswith("System B") else "A"
 
     st.header("🛠 検索パラメータ")
-    tab_name, tab_image, tab_camera = st.tabs(["カード名", "画像から", "カメラ"])
+    tab_name, tab_text, tab_image, tab_camera = st.tabs(["カード名", "テキスト検索", "画像から", "カメラ"])
     effective_query_name = None
     query = None
 
     with tab_name:
         names = [""] + DF[COL_NAME].astype(str).tolist()
         query = st.selectbox("カード名を選択", options=names)
+
+    with tab_text:
+        st.caption("英語で抽象的なキーワードを入力してください。例: cute girl magician、dragon with blue eyes")
+        text_query = st.text_input("🔍 フリーテキスト検索", placeholder="e.g. cute girl magician")
+        n_text_candidates = st.slider("候補カード数", 3, 10, 5, 1)
+        text_search_button = st.button("🔍 テキストで候補を探す", use_container_width=True)
+
+        if text_search_button and text_query.strip():
+            if not ENCODER_OK:
+                st.error("CLIP モデルが未ロードのため、テキスト検索は使用できません。")
+            else:
+                with st.spinner("テキストからカードを検索中…"):
+                    try:
+                        import open_clip
+                        tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+                        with torch.no_grad():
+                            tokens = tokenizer([text_query])
+                            text_feat = model_clip.encode_text(tokens)
+                            text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+                        text_vec = text_feat.cpu().numpy().astype(np.float32)[0]
+                        sims = np.dot(rec.art, text_vec)
+                        top_idx = np.argsort(-sims)[:n_text_candidates]
+                        candidates_df = rec.db.iloc[top_idx].copy()
+                        candidates_df["text_sim"] = sims[top_idx]
+                        candidates_df = candidates_df.join(DF["image_url_runtime"], how="left")
+                        st.session_state["text_candidates"] = candidates_df
+                        st.session_state["text_query_used"] = text_query
+                    except Exception as e:
+                        st.error(f"テキスト検索エラー：{e}")
+
+        # 候補カードを表示して選択させる
+        if "text_candidates" in st.session_state:
+            cands = st.session_state["text_candidates"]
+            st.markdown(f"**「{st.session_state.get('text_query_used', '')}」の候補カード — クリックして選択**")
+            for i, (_, row) in enumerate(cands.iterrows()):
+                card_name = str(row[COL_NAME])
+                img_url = image_url_for_row(row) or ""
+                sim_pct = int(float(row["text_sim"]) * 100)
+                col_img, col_info = st.columns([1, 3])
+                with col_img:
+                    if img_url:
+                        show_image_url(img_url)
+                with col_info:
+                    st.markdown(f"**{card_name}**")
+                    st.caption(f"テキスト類似度: {sim_pct}%")
+                    if st.button(f"✅ これを選択", key=f"text_sel_{i}"):
+                        st.session_state["text_selected_card"] = card_name
+                        st.rerun()
+                st.divider()
+
+        # 選択済みカードを表示
+        if "text_selected_card" in st.session_state:
+            selected = st.session_state["text_selected_card"]
+            st.success(f"🎯 選択中のカード：**{selected}**")
+            if st.button("❌ 選択を解除", key="text_clear"):
+                del st.session_state["text_selected_card"]
+                del st.session_state["text_candidates"]
+                st.rerun()
 
     with tab_image:
         # いつでもアップロード表示（エンコーダ有無に依存しない）
@@ -289,8 +347,9 @@ with st.sidebar:
         else:
             st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
+    # テキスト検索で選択されたカードを優先
     if not effective_query_name:
-        effective_query_name = query or None
+        effective_query_name = st.session_state.get("text_selected_card") or query or None
 
     with st.expander("Advanced（研究者向け）", expanded=True):
         topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
@@ -466,6 +525,11 @@ if fire:
     if not effective_query_name:
         st.warning("基準となるカード（または画像）を選んでください。")
     else:
+        # テキスト検索経由の場合、元のクエリを表示
+        if st.session_state.get("text_selected_card") == effective_query_name:
+            used_query = st.session_state.get("text_query_used", "")
+            st.info(f"💬 テキスト検索「**{used_query}**」から選択されたカードで推薦します")
+
         base_df = DF[DF[COL_NAME] == effective_query_name]
         if len(base_df):
             st.subheader("🔎 基準カード")
