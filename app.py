@@ -115,6 +115,39 @@ def similarity_bar(label: str, value: float, note: str=""):
         unsafe_allow_html=True,
     )
 
+def synced_slider(label: str, vmin, vmax, default, step, key: str, disabled: bool = False):
+    """スライダーと数値入力を連動させる（スライダー操作が苦手でも、数値を直接入力できる）。"""
+    is_int = all(isinstance(x, int) for x in (vmin, vmax, default, step))
+    ks, kn = f"{key}_slider", f"{key}_num"
+    if ks not in st.session_state:
+        st.session_state[ks] = default
+    if kn not in st.session_state:
+        st.session_state[kn] = default
+
+    def _snap(v):
+        v = min(max(v, vmin), vmax)
+        v = round(round((v - vmin) / step) * step + vmin, 6)
+        return int(round(v)) if is_int else float(v)
+
+    def _slider_changed():
+        st.session_state[kn] = _snap(st.session_state[ks])
+
+    def _number_changed():
+        v = _snap(st.session_state[kn])
+        st.session_state[kn] = v
+        st.session_state[ks] = v
+
+    st.markdown(f"<div style='font-size:14px;margin-bottom:-6px'>{label}</div>", unsafe_allow_html=True)
+    c_slider, c_num = st.columns([3, 2])
+    with c_slider:
+        st.slider(label, vmin, vmax, step=step, key=ks, on_change=_slider_changed,
+                  disabled=disabled, label_visibility="collapsed")
+    with c_num:
+        st.number_input(label, vmin, vmax, step=step, key=kn, on_change=_number_changed,
+                        disabled=disabled, label_visibility="collapsed",
+                        format="%d" if is_int else "%.2f")
+    return st.session_state[ks]
+
 # =========================
 # ページ設定 & データ読込
 # =========================
@@ -336,14 +369,36 @@ with st.sidebar:
         effective_query_name = st.session_state.get("text_selected_card") or query or None
 
     with st.expander("Advanced（研究者向け）", expanded=True):
-        topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
+        topk    = synced_slider("Top-K（表示件数）", 6, 36, 18, 2, key="topk")
         fusion  = st.selectbox("融合方式", ["rrf", "power_mean"], index=0,
                                help="RRF：順位ベースで、スコアの尺度差に頑健。power_mean：各モダリティのスコアの冪平均。p が大きいほど『特に高い1つ』を重視し、p=1 は単純な加重平均。")
-        p_power = st.slider("冪平均 p（大きいほど 1つでも高得点のカードを優遇）", 1.0, 3.0, 1.5, 0.1,
-                            disabled=(fusion != "power_mean"))
-        k_each     = st.slider("各モダリティの候補数 k_each", 50, 400, 150, 10)
+        p_power = synced_slider("冪平均 p（大きいほど 1つでも高得点のカードを優遇）", 1.0, 3.0, 1.5, 0.1,
+                                key="p_power", disabled=(fusion != "power_mean"))
+        k_each     = synced_slider("各モダリティの候補数 k_each", 50, 400, 150, 10, key="k_each")
         use_mmr    = st.checkbox("MMR による多様性再ランキングを使用", True)
-        mmr_lambda = st.slider("MMR λ（関連性 vs 反冗長）", 0.1, 0.95, 0.7, 0.05)
+        mmr_lambda = synced_slider("MMR λ（関連性 vs 反冗長）", 0.1, 0.95, 0.7, 0.05, key="mmr_lambda")
+
+    with st.expander("ℹ️ ATK/DEF などの数値がないカードは、どう比べている？", expanded=False):
+        st.markdown(
+            """
+**メタデータ類似度の中身**
+
+- 種別・属性・種族が一致するか（40%）
+- レベル・ATK・DEF が近いか（60%）
+
+**魔法・罠（数値がないカード）の扱い**
+
+1. レベル・ATK・DEF がないので、**全カードの中央値で補って**計算しています。
+2. そのため、魔法・罠どうしは数値の部分が常に一致（100%）になり、差は種別と種族（通常・永続・速攻など）だけで決まります。
+3. 基準が魔法・罠のとき、モンスターは種別が違うので0点ですが、数値が「中央値のモンスター」に近いと、メタデータ類似度が実態より高く出ます。
+
+**この方法の限界と判断**
+
+- 数値がないカードのメタデータ類似度は**目安**です。魔法・罠では画像・テキストの類似度のほうが判断材料になります。
+- 「数値がない＝似ていない」と扱う案も試しましたが、同じ系列のカードを拾える割合が少し下がったため、現状は据え置いています。
+- 今後は、魔法・罠の種族や効果の種類を使った別の比べ方を検討したいと考えています。
+            """
+        )
 
     st.divider()
     debug = st.toggle("🔧 デバッグ情報を表示", value=False)
