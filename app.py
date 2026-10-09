@@ -1,6 +1,7 @@
 # app.py — 遊戯王カード 多モーダル推薦（A/B実験・4列グリッド・画像互換対応）
 from __future__ import annotations
 import os, json
+from html import escape as _esc
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -76,6 +77,27 @@ def pill(text: str):
     )
 
 def fmt(v): return "-" if pd.isna(v) else str(v)
+
+def _num_str(v) -> str:
+    """ATK/DEF などを '1800.0' ではなく '1800' で表示する（欠損は '-'）"""
+    if pd.isna(v):
+        return "-"
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else str(f)
+    except Exception:
+        return _esc(str(v))
+
+def _bar_html(label: str, value: float, note: str = "") -> str:
+    """カード内に埋め込む HTML 版の類似度バー（改行を含めないこと：Markdown に解釈されるため）"""
+    try:
+        v = float(value); v = 0.0 if np.isnan(v) else max(0.0, min(1.0, v))
+    except Exception:
+        v = 0.0
+    pct = 100 if v >= 1 - 1e-6 else int(np.floor(v * 100))
+    return (f'<div class="ygo-sim"><div class="ygo-sim-label">{label}：{pct}%</div>'
+            f'<div class="ygo-bar"><div class="ygo-bar-fill" style="width:{pct}%"></div></div>'
+            f'<div class="ygo-sim-note">{note}</div></div>')
 
 def similarity_bar(label: str, value: float, note: str=""):
     try:
@@ -394,31 +416,46 @@ def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
         color: #eee;
         word-break: break-word;
     }
+    .ygo-grid { align-items: start; }
+    .ygo-detail { width: 100%; margin-top: 6px; font-size: 11px; color: #ddd; }
+    .ygo-detail summary { cursor: pointer; text-align: center; color: #9db4ff; font-size: 11px; }
+    .ygo-sim { margin-top: 6px; }
+    .ygo-sim-label { font-size: 11px; color: #eee; }
+    .ygo-sim-note { font-size: 10px; color: #aaa; margin-top: 2px; }
+    .ygo-bar { background: #333; border-radius: 6px; height: 8px; overflow: hidden; margin-top: 2px; }
+    .ygo-bar-fill { height: 100%; background: #16a34a; }
     @media (max-width: 480px) {
         .ygo-grid { grid-template-columns: repeat(2, 1fr); }
     }
     </style>
     """, unsafe_allow_html=True)
 
+    # 総合スコアは融合方式によって尺度が違う（RRF は 0.01 前後、冪平均は 0〜1）ため、
+    # 表示では「表示中の1位を100%とした相対値」にして、どちらの方式でも読めるようにする
+    try:
+        max_final = float(pd.to_numeric(results_df["final_score"], errors="coerce").max())
+    except Exception:
+        max_final = 0.0
+
     cards_html = '<div class="ygo-grid">'
     for _, row in results_df.iterrows():
         d = row.to_dict()
-        name = str(d.get(COL_NAME, "Unknown"))
+        name = _esc(str(d.get(COL_NAME, "Unknown")))
         img_url = image_url_for_row(row) or ""
         img_tag = f'<img src="{img_url}" alt="{name}">' if img_url else ""
-        cards_html += f'<div class="ygo-card">{img_tag}<div class="ygo-card-name">{name}</div></div>'
+        total_rel = (float(d.get("final_score", 0.0)) / max_final) if max_final > 0 else 0.0
+        details = (
+            '<details class="ygo-detail"><summary>推薦の根拠を見る</summary>'
+            + _bar_html("🖼️ 画像類似度", d.get("art_sim", 0.0), "絵柄・色味などの近さ")
+            + _bar_html("📖 テキスト類似度", d.get("lore_sim", 0.0), "効果テキストの意味の近さ")
+            + _bar_html("🔢 メタデータ類似度", d.get("meta_sim", 0.0), "種別・ATK/DEF 等の一致度")
+            + _bar_html("⭐ 総合スコア", total_rel, "上記を融合した評価（表示中の1位=100%）")
+            + f'<div class="ygo-sim-note">種別: {_esc(fmt(d.get(COL_TYPE)))} / ATK: {_num_str(d.get(COL_ATK))} / DEF: {_num_str(d.get(COL_DEF))}</div>'
+            + '</details>'
+        )
+        cards_html += f'<div class="ygo-card">{img_tag}<div class="ygo-card-name">{name}</div>{details}</div>'
     cards_html += '</div>'
     st.markdown(cards_html, unsafe_allow_html=True)
-
-    with st.expander("📋 全結果の詳細スコアを見る", expanded=False):
-        for _, row in results_df.iterrows():
-            d = row.to_dict()
-            st.markdown(f"**{d.get(COL_NAME, 'Unknown')}**")
-            similarity_bar("🖼️ 画像類似度",      d.get("art_sim", 0.0),    "絵柄・色味などの近さ")
-            similarity_bar("📖 テキスト類似度",   d.get("lore_sim", 0.0),   "効果テキストの意味の近さ")
-            similarity_bar("🔢 メタデータ類似度", d.get("meta_sim", 0.0),   "種別・ATK/DEF 等の一致度")
-            similarity_bar("⭐ 総合スコア",       d.get("final_score", 0.0), "上記を融合した最終評価")
-            st.divider()
 
 # =========================
 # A/B 通知バナー
