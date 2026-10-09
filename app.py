@@ -316,8 +316,8 @@ with st.sidebar:
     with st.expander("Advanced（研究者向け）", expanded=True):
         topk    = st.slider("Top-K（表示件数）", 6, 36, 18, 2)
         fusion  = st.selectbox("融合方式", ["rrf", "power_mean"], index=0,
-                               help="RRF：スコア尺度に頑健。power_mean：複数モダリティ同時高得点を優遇。")
-        p_power = st.slider("冪平均 p（>1 ほど 同時に高得点 を優遇）", 1.0, 3.0, 1.5, 0.1,
+                               help="RRF：順位ベースで、スコアの尺度差に頑健。power_mean：各モダリティのスコアの冪平均。p が大きいほど『特に高い1つ』を重視し、p=1 は単純な加重平均。")
+        p_power = st.slider("冪平均 p（大きいほど 1つでも高得点のカードを優遇）", 1.0, 3.0, 1.5, 0.1,
                             disabled=(fusion != "power_mean"))
         k_each     = st.slider("各モダリティの候補数 k_each", 50, 400, 150, 10)
         use_mmr    = st.checkbox("MMR による多様性再ランキングを使用", True)
@@ -483,24 +483,19 @@ if fire:
 
         with st.spinner("計算中…"):
             try:
-                _saved_engine = rec.meta_engine
-                if ab_system == "A":
-                    rec.meta_engine = None
-                else:
-                    rec.meta_engine = _saved_engine
-
+                # A/B の切替は recommend() の ab_system 引数で行う
+                # （以前は rec.meta_engine を一時的に None にしていたが、System A でエラーになるバグがあった）
                 results: pd.DataFrame = rec.recommend(
                     query_name=effective_query_name,
                     top_n=int(topk), k_each=int(k_each),
                     fusion=fusion, p_power=float(p_power),
-                    use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda)
+                    use_mmr=bool(use_mmr), mmr_lambda=float(mmr_lambda),
+                    ab_system=ab_system,
                 )
             except Exception as e:
                 st.error("推薦の計算に失敗しました。")
                 st.exception(e)
                 results = None
-            finally:
-                rec.meta_engine = _saved_engine
 
         if results is not None and len(results):
             results = results.join(DF["image_url_runtime"], how="left")
