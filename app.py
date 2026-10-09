@@ -502,21 +502,65 @@ if "text_candidates" in st.session_state and "text_selected_card" not in st.sess
     st.divider()
 
 # =========================
+# 結果の描画（検索履歴つき）
+# =========================
+MAX_HISTORY = 5   # 1ページに残す検索結果の数（最新 + 過去4件）
+
+def render_history_entry(entry: Dict[str, Any], nested: bool = False):
+    """1回分の検索結果（基準カード・設定・Top-N）を描画する。nested=True は expander の中（expander を入れ子にできない）。"""
+    if entry.get("text_note"):
+        st.info(entry["text_note"])
+    base_row = entry.get("base_row")
+    if base_row is not None:
+        st.subheader("🔎 基準カード")
+        render_card_full(base_row)
+        st.divider()
+
+    results = entry["results"]
+    st.subheader(f"Top-{entry['topk']} の結果")
+    cfg = f"System {entry['ab_system']} ／ 融合: {entry['fusion']}"
+    if entry["fusion"] == "power_mean":
+        cfg += f"（p={entry['p_power']:.1f}）"
+    cfg += " ／ MMR: " + (f"λ={entry['mmr_lambda']:.2f}" if entry["use_mmr"] else "OFF")
+    cfg += f" ／ k_each={entry['k_each']}"
+    st.caption("🧾 この検索の設定： " + cfg)
+
+    if entry["use_mmr"]:
+        st.caption("※ MMR が有効なので、並び順は総合スコア順ではありません。"
+                   "「関連性（総合スコア）」と「すでに選んだカードと絵柄が似すぎていないか」のバランスで決まるため、"
+                   "総合スコアが高くても、先に並んだカードと絵柄が近いと順位が下がります。")
+    qtype = entry.get("query_type", "")
+    if ("Spell" in qtype) or ("Trap" in qtype):
+        st.caption("※ 基準カードが魔法・罠のため、レベル/ATK/DEF の数値がありません。"
+                   "数値は全カードの中央値で補って計算しているので、モンスターの「メタデータ類似度」は"
+                   "実態より高く出ることがあります（目安として見てください）。")
+
+    # key を付けて状態を保持する（検索履歴が session_state にあるので、切り替えても結果は消えない）
+    screenshot_mode = st.toggle("📸 スクリーンショット用（先頭4枚だけ表示）", value=False,
+                                key=f"shot_{entry['id']}")
+    render_results_grid(results.head(4) if screenshot_mode else results, n_cols=4)
+
+    if not nested:
+        with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
+            st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
+            if rec.meta_engine is not None:
+                st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
+            else:
+                st.caption("Baseline（System A）ではメタは埋め込みコサインで計算。")
+
+# =========================
 # メイン処理
 # =========================
 if fire:
     if not effective_query_name:
         st.warning("基準となるカード（または画像）を選んでください。")
     else:
+        text_note = None
         if st.session_state.get("text_selected_card") == effective_query_name:
             used_query = st.session_state.get("text_query_used", "")
-            st.info(f"💬 テキスト検索「**{used_query}**」→ **{effective_query_name}** で推薦します")
+            text_note = f"💬 テキスト検索「**{used_query}**」→ **{effective_query_name}** で推薦します"
 
         base_df = DF[DF[COL_NAME] == effective_query_name]
-        if len(base_df):
-            st.subheader("🔎 基準カード")
-            render_card_full(base_df.iloc[0])
-            st.divider()
 
         with st.spinner("計算中…"):
             try:
@@ -536,32 +580,40 @@ if fire:
 
         if results is not None and len(results):
             results = results.join(DF["image_url_runtime"], how="left")
-
-            st.subheader(f"Top-{topk} の結果")
-            if use_mmr:
-                st.caption("※ MMR が有効なので、並び順は総合スコア順ではありません。"
-                           "「関連性（総合スコア）」と「すでに選んだカードと絵柄が似すぎていないか」のバランスで決まるため、"
-                           "総合スコアが高くても、先に並んだカードと絵柄が近いと順位が下がります。")
-            if len(base_df):
-                _qtype = str(base_df.iloc[0].get(COL_TYPE, ""))
-                if ("Spell" in _qtype) or ("Trap" in _qtype):
-                    st.caption("※ 基準カードが魔法・罠のため、レベル/ATK/DEF の数値がありません。"
-                               "数値は全カードの中央値で補って計算しているので、モンスターの「メタデータ類似度」は"
-                               "実態より高く出ることがあります（目安として見てください）。")
-            screenshot_mode = st.toggle("📸 スクリーンショット用（先頭4枚を4列グリッドで表示）", value=False)
-            if screenshot_mode:
-                render_results_grid(results.head(4), n_cols=4)
-            else:
-                render_results_grid(results, n_cols=4)
-
-            with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
-                st.write("MetaEngine 状態：", "✅ 有効" if rec.meta_engine is not None else "❌ 無効")
-                if rec.meta_engine is not None:
-                    st.caption(f"σ (Level, ATK, DEF) = {list(map(float, rec.meta_engine.sigma))}")
-                else:
-                    st.caption("Baseline（System A）ではメタは埋め込みコサインで計算。")
-        else:
+            seq = st.session_state.get("hist_seq", 0) + 1
+            st.session_state["hist_seq"] = seq
+            entry = {
+                "id": seq,
+                "query_name": effective_query_name,
+                "query_type": str(base_df.iloc[0].get(COL_TYPE, "")) if len(base_df) else "",
+                "base_row": base_df.iloc[0] if len(base_df) else None,
+                "results": results,
+                "topk": int(topk), "k_each": int(k_each),
+                "fusion": fusion, "p_power": float(p_power),
+                "use_mmr": bool(use_mmr), "mmr_lambda": float(mmr_lambda),
+                "ab_system": ab_system,
+                "text_note": text_note,
+            }
+            hist = [entry] + st.session_state.get("history", [])
+            st.session_state["history"] = hist[:MAX_HISTORY]
+        elif results is not None:
             st.info("該当する結果がありません。")
-else:
-    if "text_candidates" not in st.session_state:
-        st.info("左側でカード名を選ぶか、テキスト/画像/カメラで検索して「🔮 検索」を押してください。")
+
+# 履歴は session_state にあるので、ボタンやスライダーを操作して画面が再実行されても消えない
+history = st.session_state.get("history", [])
+if history:
+    _, clear_col = st.columns([4, 1])
+    with clear_col:
+        if st.button("🗑 履歴をクリア", use_container_width=True):
+            st.session_state["history"] = []
+            st.rerun()
+    render_history_entry(history[0])
+    if len(history) > 1:
+        st.divider()
+        st.markdown(f"#### 🕘 過去の検索（{len(history) - 1}件・最大{MAX_HISTORY}件まで保持）")
+        for e in history[1:]:
+            label = f"#{e['id']}  {e['query_name']} ／ System {e['ab_system']}・{e['fusion']}・Top-{e['topk']}"
+            with st.expander(label, expanded=False):
+                render_history_entry(e, nested=True)
+elif "text_candidates" not in st.session_state:
+    st.info("左側でカード名を選ぶか、テキスト/画像/カメラで検索して「🔮 検索」を押してください。")
