@@ -538,6 +538,16 @@ if fire:
             results = results.join(DF["image_url_runtime"], how="left")
 
             st.subheader(f"Top-{topk} の結果")
+            if use_mmr:
+                st.caption("※ MMR が有効なので、並び順は総合スコア順ではありません。"
+                           "「関連性（総合スコア）」と「すでに選んだカードと絵柄が似すぎていないか」のバランスで決まるため、"
+                           "総合スコアが高くても、先に並んだカードと絵柄が近いと順位が下がります。")
+            if len(base_df):
+                _qtype = str(base_df.iloc[0].get(COL_TYPE, ""))
+                if ("Spell" in _qtype) or ("Trap" in _qtype):
+                    st.caption("※ 基準カードが魔法・罠のため、レベル/ATK/DEF の数値がありません。"
+                               "数値は全カードの中央値で補って計算しているので、モンスターの「メタデータ類似度」は"
+                               "実態より高く出ることがあります（目安として見てください）。")
             screenshot_mode = st.toggle("📸 スクリーンショット用（先頭4枚を4列グリッドで表示）", value=False)
             if screenshot_mode:
                 render_results_grid(results.head(4), n_cols=4)
