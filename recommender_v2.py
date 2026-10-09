@@ -475,6 +475,12 @@ class RecommenderV2:
             np.array([rel_scores.get(int(c), 0.0) for c in cand_arr], dtype=np.float32),
             nan=0.0, posinf=0.0, neginf=0.0
         )
+        # 関連性スコアを候補内で 0〜1 に揃える。
+        # RRF のスコアは 0.01 前後と小さく、冗長ペナルティ（画像 cosine, 0〜1）に常に負けて
+        # λ が意味を持たなくなるため、尺度を合わせてから λ で重みづけする。
+        rel_min, rel_max = float(rel_vec.min()), float(rel_vec.max())
+        if rel_max > rel_min:
+            rel_vec = (rel_vec - rel_min) / (rel_max - rel_min)
         selected: list[int] = []
         available = np.ones(m, dtype=bool)
         first = int(np.argmax(rel_vec))
