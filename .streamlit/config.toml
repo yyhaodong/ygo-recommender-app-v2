@@ -1,0 +1,3 @@
+[server]
+# app.py の IMG_MAX_BYTES（10MB）と合わせる。アップロード欄の「Limit ○MB per file」表示もこの値になる
+maxUploadSize = 10

@@ -38,6 +38,10 @@ if os.path.exists("clip_config.json"):
         PRETRAINED = _cfg.get("PRETRAINED", PRETRAINED)
     except Exception:
         pass
+# detect_clip_model.py が書く clip_config.json は "ViT-B-32" になる（候補に quickgelu がないため）。
+# OpenAI の重みなら同じ重みの正しい構成（QuickGELU）に読み替える。
+if PRETRAINED == "openai" and MODEL_NAME == "ViT-B-32":
+    MODEL_NAME = "ViT-B-32-quickgelu"
 
 # =========================
 # 画像表示ユーティリティ（後方互換）
@@ -272,10 +276,12 @@ UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp", "gif"] + (["heic", "heif"] if HEIF
 CARD_HW = 614 / 421                       # 遊戯王カード画像の 縦/横
 # カードDBの画像ベクトルを作ったときの「絵柄部分の切り出し」（source_data/main_config.yaml の adaptive_crop）
 # 2011 年を境にカードの枠が変わるため 2 種類ある。アップロード画像の年代は分からないので両方試す。
+# Colab 検証（独立 148 枚, QuickGELU）: post 切り出しの self_cos 中央値 0.999 = 生成時の処理と一致
 ART_BOXES = {"post": (0.11, 0.25, 0.89, 0.59), "pre": (0.125, 0.26, 0.875, 0.58)}
 IMAGE_TOPK = 5
 # 複数の切り出し方の結果をどうまとめるか: "max"=余弦の最大 / "z"=切り出し方ごとに標準化してから最大 / "rrf"=順位で統合
-IMAGE_MERGE = "z"
+# Colab 検証（独立 148 枚・3 通り全部 + max）の top-5：整卡 100% / 絵柄 95.9% / 模擬撮影 94.6% / 模擬スクショ 100% / 低解像度 68.9%
+IMAGE_MERGE = "max"
 
 
 def load_query_image(data: bytes) -> Image.Image:
@@ -297,7 +303,8 @@ def load_query_image(data: bytes) -> Image.Image:
 
 
 def classify_query_image(w: int, h: int) -> str:
-    """縦横比だけで入力の種類を推定する: card=カード全体 / art=絵柄だけ(ほぼ正方形) / other=それ以外（写真・スクショ等）"""
+    """縦横比から入力の形を推定する（画面の説明用のみ。検索に使う切り出し方には影響しない）
+    card=カード全体らしい / art=絵柄だけらしい(ほぼ正方形) / other=それ以外（写真・スクショ等）"""
     r = h / max(w, 1)
     if abs(r / CARD_HW - 1) <= 0.10:
         return "card"
@@ -307,15 +314,14 @@ def classify_query_image(w: int, h: int) -> str:
 
 
 def query_views(img: Image.Image) -> Tuple[str, Dict[str, Image.Image]]:
-    """入力の種類に応じて、CLIP に渡す画像（切り出し方）を用意する"""
+    """CLIP に渡す画像を 3 通り用意する: direct=そのまま / pre・post=カードDBと同じ絵柄の切り出し。
+    縦横比による振り分けはしない（スクショ等で判定を誤ると正解を取りこぼすため。Colab 検証で確認）。
+    kind は画面の説明用。"""
     kind = classify_query_image(*img.size)
     w, h = img.size
-    crops = {k: img.crop((int(l * w), int(t * h), int(r * w), int(b * h))) for k, (l, t, r, b) in ART_BOXES.items()}
-    if kind == "card":
-        return kind, crops                          # カード全体 → 絵柄部分だけ（カードDBと同じ切り出し）
-    if kind == "art":
-        return kind, {"direct": img}                # すでに絵柄だけ → そのまま
-    return kind, {"direct": img, **crops}           # 判断できない → 全部試す
+    views = {"direct": img}
+    views.update({k: img.crop((int(l * w), int(t * h), int(r * w), int(b * h))) for k, (l, t, r, b) in ART_BOXES.items()})
+    return kind, views
 
 
 def merge_view_scores(S: np.ndarray, method: str = IMAGE_MERGE) -> np.ndarray:
@@ -788,15 +794,15 @@ if _cands is not None and not st.session_state.get("cand_picked"):
         st.subheader(f"🔍「{_label}」の候補カード")
     else:
         st.subheader(f"🖼 {_SOURCE_LABEL.get(_src, '画像')}の候補カード（上位 {len(_cands)} 枚）")
-        _kind_text = {"card": "カード全体の画像 → 絵柄部分を切り出して比較しました",
-                      "art": "絵柄だけの画像 → そのまま比較しました",
-                      "other": "カード全体か判断できない画像 → 画像全体と、絵柄の切り出しの両方で比較しました"}
+        _shape = {"card": "カード全体", "art": "絵柄だけ", "other": "写真・スクリーンショットなど"}
         c_img, c_txt = st.columns([1, 5])
         if _info.get("thumb") is not None:
             c_img.image(_info["thumb"], width=120)
-        c_txt.caption("判定：" + _kind_text.get(_info.get("kind", ""), "—"))
-        c_txt.caption("※ 下の数値は CLIP の画像ベクトルの近さ（参考値）で、正しく識別できた確率ではありません。"
-                      "正しいカードが 1 位とは限らないので、目で確認して選んでください。")
+        c_txt.caption("比べ方：画像をそのまま／絵柄部分の切り出し（カードの枠の新旧 2 種類）の 3 通りで比べ、"
+                      "いちばん近かった値で並べています。"
+                      f"（画像の形から見ると「{_shape.get(_info.get('kind', ''), '—')}」のようです）")
+        c_txt.caption("※ 順位がいちばん大事です。「近さ」は CLIP の画像ベクトルの余弦（並べ替えに使った値）で、"
+                      "正しく識別できた確率ではありません。1 位が正解とは限らないので、目で確認して選んでください。")
     st.caption("カードを選ぶと、そのカードを基準に推薦します（その後「🔮 検索」を押してください）")
 
     cols = st.columns(len(_cands))
@@ -806,8 +812,8 @@ if _cands is not None and not st.session_state.get("cand_picked"):
             img_url = image_url_for_row(row) or ""
             if img_url and _is_allowed_image_url(img_url):
                 st.image(img_url, use_column_width=True)   # URL のまま渡す＝ブラウザが直接読み込む（サーバー側では取得しない）
-            st.caption(f"**{card_name}**")
-            st.caption(f"近さ（参考）: {float(row['cand_score']):.3f}")
+            st.markdown(f"**{i + 1} 位**　{_esc(card_name)}")
+            st.caption(f"近さ（参考）: {float(row['cand_score']):.2f}")
             st.button("✅ 選択", key=f"main_sel_{i}", use_container_width=True,
                       on_click=_pick_candidate, args=(card_name,))
 
