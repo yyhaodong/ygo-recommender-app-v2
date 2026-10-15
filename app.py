@@ -228,10 +228,10 @@ try:
         return model, preprocess, torch
     model_clip, preprocess_clip, torch = get_img_encoder()
     ENCODER_OK = True
-    st.caption(f"🔧 CLIP: {MODEL_NAME} / {PRETRAINED}")
+    ENCODER_LABEL = f"CLIP: {MODEL_NAME} / {PRETRAINED}"
 except Exception:
-    st.info("画像検索は未有効（torch/open-clip 未インストールまたは読み込み失敗）。")
     ENCODER_OK = False
+    ENCODER_LABEL = "画像検索は無効（torch/open-clip を読み込めません）"
 
 def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
     if not ENCODER_OK:
@@ -412,7 +412,7 @@ with st.sidebar:
 GRID_MIN_PX = 160      # grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))
 GRID_GAP_PX = 12       # gap: 12px
 CARD_INSET_PX = 18     # .ygo-card の padding 8px×2 + border 1px×2（画像はこの分だけ列幅より狭い）
-BASE_AREA_RATIO = 1.75 # 基準カードの面積 ÷ 推薦カード1枚の面積（1.5〜2 の中間）
+BASE_AREA_RATIO = 2.0  # 基準カードの面積 ÷ 推薦カード1枚の面積（1.5〜2 の範囲で調整可）
 CARD_ASPECT = "421 / 614"  # YGOPRODeck のカード画像の縦横比（変形・切り抜きなし）
 
 
@@ -423,6 +423,7 @@ def _base_card_css() -> str:
         n = floor((W + gap) / (min + gap))、列幅 w = (W − gap·(n−1)) / n
     コンテナクエリで n ごとの区間を書き、その区間の w を 100cqw（= W）から計算する。
     これで画面幅・ズームが変わっても、推薦カードとの面積比が常に BASE_AREA_RATIO になる。
+    見た目（背景・枠・角丸・文字色）は下の .ygo-card と揃えている。
     """
     r = BASE_AREA_RATIO ** 0.5
     step = GRID_MIN_PX + GRID_GAP_PX
@@ -431,27 +432,43 @@ def _base_card_css() -> str:
         return (f"calc({r:.4f} * ((100cqw - {GRID_GAP_PX * (n - 1)}px) / {n} - {CARD_INSET_PX}px))")
 
     rules = [
-        ".ygo-base-wrap{container-type:inline-size;container-name:ygo-base;width:100%;margin:0 0 .25rem 0;}",
-        ".ygo-base{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;width:100%;}",
+        ".ygo-base-wrap{container-type:inline-size;container-name:ygo-base;width:100%;margin:0 0 .5rem 0;}",
+        # パネル：推薦カード（.ygo-card）と同じ背景・枠・角丸
+        ".ygo-base{display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start;box-sizing:border-box;width:100%;"
+        "background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:12px;}",
         # 1行目はコンテナクエリ非対応ブラウザ用の控えめな固定上限、2行目が本来の計算式
-        f".ygo-base-img{{flex:0 0 auto;max-width:100%;width:min(100%,200px);width:{width_for(1)};}}",
+        f".ygo-base-img{{flex:0 0 auto;max-width:100%;width:min(100%,220px);width:{width_for(1)};}}",
         f".ygo-base-img img{{display:block;width:100%;height:auto;aspect-ratio:{CARD_ASPECT};"
-        "object-fit:contain;border-radius:6px;}",
-        ".ygo-base-info{flex:1 1 260px;min-width:0;}",
-        ".ygo-base-name{font-size:1.5rem;font-weight:600;line-height:1.3;margin:0 0 .25rem 0;}",
-        ".ygo-base-meta{font-size:.875rem;opacity:.7;margin-bottom:.5rem;}",
-        ".ygo-base-desc{font-size:.95rem;line-height:1.6;word-break:break-word;}",
+        "object-fit:contain;border-radius:4px;}",
+        ".ygo-base-info{flex:1 1 280px;min-width:0;max-width:72ch;}",
+        ".ygo-base-label{font-size:.8rem;color:#9db4ff;letter-spacing:.04em;margin-bottom:.25rem;}",
+        ".ygo-base-name{font-size:1.6rem;font-weight:700;line-height:1.25;color:#eee;margin:0 0 .6rem 0;}",
+        ".ygo-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:.8rem;}",
+        ".ygo-chip{font-size:.8rem;line-height:1.5;padding:1px 10px;border-radius:999px;"
+        "background:#23233d;border:1px solid #3a3a5c;color:#ccd;white-space:nowrap;}",
+        ".ygo-chip b{color:#eee;font-weight:600;margin-left:4px;}",
+        ".ygo-base-desc{font-size:1rem;line-height:1.7;color:#ddd;word-break:break-word;}",
     ]
     for n in range(2, 25):  # 列数 2〜24（W ≈ 4,100px まで）
         rules.append(f"@container ygo-base (min-width:{step * n - GRID_GAP_PX}px)"
                      f"{{.ygo-base-img{{width:{width_for(n)};}}}}")
+    # 文字が画像の下に回る幅（3列以下・約545px未満）では、画像を中央に置いて右側の空白をなくす
+    rules.append("@container ygo-base (max-width:545px){.ygo-base{justify-content:center;}}")
     # 推薦グリッドは画面幅 480px 以下で 2 列固定になるので、そこに合わせる（最後に置いて優先させる）
     rules.append(f"@media (max-width:480px){{.ygo-base-img{{width:{width_for(2)};}}}}")
     return "<style>" + "".join(rules) + "</style>"
 
 
+def _chip(label: str, value) -> str:
+    """値がある項目だけチップにする（欠損・空文字は出さない）"""
+    if value is None or (isinstance(value, float) and np.isnan(value)) or str(value).strip() in ("", "nan", "None"):
+        return ""
+    v = _num_str(value) if isinstance(value, (int, float, np.integer, np.floating)) else _esc(str(value))
+    return f'<span class="ygo-chip">{_esc(label)}<b>{v}</b></span>'
+
+
 def render_card_full(row: pd.Series | Dict[str, Any]):
-    """基準カード：画像は推薦カードの約 1.75 倍の面積、右に名前・種別・効果テキスト。
+    """基準カード：画像は推薦カード1枚の約 2 倍の面積、右に名前・属性チップ・効果テキスト。
 
     st.columns の比率ではなく HTML + CSS（flex + コンテナクエリ）で描く。
     Streamlit 内部のクラス名には依存しない（自前の .ygo-base-* だけを使う）。
@@ -459,9 +476,17 @@ def render_card_full(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     img_url = image_url_for_row(row) or ""
     name = _esc(str(d.get(COL_NAME, "Unknown")))
-    type_v = _esc(fmt(d.get(COL_TYPE)))
-    atk_v  = _esc(fmt(d.get(COL_ATK)))
-    def_v  = _esc(fmt(d.get(COL_DEF)))
+    type_raw = str(d.get(COL_TYPE) or "")
+    is_spell_trap = ("Spell" in type_raw) or ("Trap" in type_raw)
+    chips = "".join([
+        _chip("種別", d.get(COL_TYPE)),
+        _chip("属性", d.get("attribute")),
+        _chip("種類" if is_spell_trap else "種族", d.get("race")),
+        _chip("レベル", d.get("level")),
+        _chip("ATK", d.get(COL_ATK)),
+        _chip("DEF", d.get(COL_DEF)),
+        _chip("系列", d.get("archetype")),
+    ])
     desc_html = ""
     if COL_DESC:
         # 空行があると Markdown の HTML ブロックが途切れるので、改行は <br> にする
@@ -473,8 +498,9 @@ def render_card_full(row: pd.Series | Dict[str, Any]):
         + '<div class="ygo-base-wrap"><div class="ygo-base">'
         + img_html
         + '<div class="ygo-base-info">'
+        + '<div class="ygo-base-label">🔎 基準カード</div>'
         + f'<div class="ygo-base-name">{name}</div>'
-        + f'<div class="ygo-base-meta">種別: {type_v} | ATK: {atk_v} | DEF: {def_v}</div>'
+        + f'<div class="ygo-chips">{chips}</div>'
         + desc_html
         + "</div></div></div>"
     )
@@ -571,10 +597,23 @@ def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
 # =========================
 # A/B 通知バナー
 # =========================
-if ab_system == "A":
-    st.info("🧪 現在テスト中：System A（Baseline: Min-Max + Cosine）", icon="🧪")
-else:
-    st.success("🧪 現在テスト中：System B（Proposed: Gaussian Kernel）", icon="🧪")
+_sys_label = ("System A（Baseline: Min-Max + Cosine）" if ab_system == "A"
+              else "System B（Proposed: Gaussian Kernel）")
+_sys_cls = "ygo-pill-a" if ab_system == "A" else "ygo-pill-b"
+# 上部は1行のステータスだけにする（履歴のクリアはページ下部へ移動）
+st.markdown(
+    "<style>"
+    ".ygo-status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:-.25rem 0 .25rem 0;}"
+    ".ygo-pill{font-size:.85rem;line-height:1.6;padding:2px 12px;border-radius:999px;border:1px solid #3a3a5c;"
+    "background:#23233d;color:#ccd;}"
+    ".ygo-pill-b{background:rgba(22,163,74,.15);border-color:rgba(22,163,74,.6);color:#bfe8cc;}"
+    ".ygo-pill-a{background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.6);color:#c7dbff;}"
+    "</style>"
+    f'<div class="ygo-status"><span class="ygo-pill {_sys_cls}">🧪 現在テスト中：{_esc(_sys_label)}</span>'
+    f'<span class="ygo-pill">🔧 {_esc(ENCODER_LABEL)}</span></div>',
+    unsafe_allow_html=True,
+)
+
 
 # デバッグ
 if debug:
@@ -623,12 +662,20 @@ def render_history_entry(entry: Dict[str, Any], nested: bool = False):
         st.info(entry["text_note"])
     base_row = entry.get("base_row")
     if base_row is not None:
-        st.subheader("🔎 基準カード")
         render_card_full(base_row)
-        st.divider()
 
     results = entry["results"]
-    st.subheader(f"Top-{entry['topk']} の結果")
+    # 見出しの右にスクリーンショット切替（key を付けて状態を保持：検索履歴が session_state にあるので消えない）
+    head_col, shot_col = st.columns([3, 1])
+    with head_col:
+        st.subheader(f"Top-{entry['topk']} の結果")
+    with shot_col:
+        screenshot_mode = st.toggle("📸 先頭4枚のみ", value=False, key=f"shot_{entry['id']}",
+                                    help="スクリーンショット用：先頭4枚だけ表示します")
+    render_results_grid(results.head(4) if screenshot_mode else results, n_cols=4)
+
+    # 設定と注意書きは結果の下にまとめる
+    st.markdown('<div style="height:.75rem"></div>', unsafe_allow_html=True)
     cfg = f"System {entry['ab_system']} ／ 融合: {entry['fusion']}"
     if entry["fusion"] == "power_mean":
         cfg += f"（p={entry['p_power']:.1f}）"
@@ -645,11 +692,6 @@ def render_history_entry(entry: Dict[str, Any], nested: bool = False):
         st.caption("※ 基準カードが魔法・罠のため、レベル/ATK/DEF の数値がありません。"
                    "数値は全カードの中央値で補って計算しているので、モンスターの「メタデータ類似度」は"
                    "実態より高く出ることがあります（目安として見てください）。")
-
-    # key を付けて状態を保持する（検索履歴が session_state にあるので、切り替えても結果は消えない）
-    screenshot_mode = st.toggle("📸 スクリーンショット用（先頭4枚だけ表示）", value=False,
-                                key=f"shot_{entry['id']}")
-    render_results_grid(results.head(4) if screenshot_mode else results, n_cols=4)
 
     if not nested:
         with st.expander("🔧 開発者デバッグ（Meta 相似分解）", expanded=False):
@@ -713,11 +755,6 @@ if fire:
 # 履歴は session_state にあるので、ボタンやスライダーを操作して画面が再実行されても消えない
 history = st.session_state.get("history", [])
 if history:
-    _, clear_col = st.columns([4, 1])
-    with clear_col:
-        if st.button("🗑 履歴をクリア", use_container_width=True):
-            st.session_state["history"] = []
-            st.rerun()
     render_history_entry(history[0])
     if len(history) > 1:
         st.divider()
@@ -726,5 +763,9 @@ if history:
             label = f"#{e['id']}  {e['query_name']} ／ System {e['ab_system']}・{e['fusion']}・Top-{e['topk']}"
             with st.expander(label, expanded=False):
                 render_history_entry(e, nested=True)
+    # 履歴のクリアは一番下に置く（上部をすっきりさせるため）
+    if st.button("🗑 検索履歴をクリア"):
+        st.session_state["history"] = []
+        st.rerun()
 elif "text_candidates" not in st.session_state:
     st.info("左側でカード名を選ぶか、テキスト/画像/カメラで検索して「🔮 検索」を押してください。")
