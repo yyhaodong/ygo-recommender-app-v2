@@ -1,28 +1,33 @@
 # app.py — 遊戯王カード 多モーダル推薦（A/B実験・4列グリッド・画像互換対応）
 from __future__ import annotations
-import os, json
+import os, json, hashlib
 from html import escape as _esc
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 
 # --- HEIC/HEIF 画像サポート（iPhone対策：未導入でも可）---
+HEIF_OK = False
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
+    HEIF_OK = True
 except Exception:
     pass
 
 APP_ROOT = Path(__file__).resolve().parent
 
 # ======== CLIP 設定（512 次元で確認） ========
-MODEL_NAME = "ViT-B-32"
+# OpenAI の重みは QuickGELU で学習されている。"ViT-B-32" だと活性化関数が合わず警告が出て、
+# カードDBの画像ベクトル（HF transformers 版で生成）と少しずれる（Colab 診断：余弦の中央値 0.965）。
+MODEL_NAME = "ViT-B-32-quickgelu"
 PRETRAINED = "openai"
 
 # 任意: clip_config.json があれば上書き
@@ -46,18 +51,33 @@ def _img_fit(image_obj, *, caption=None):
         else:
             raise
 
+# サーバー側で画像を取りに行くのは、カード画像の配信元だけに限定する（任意 URL の取得はしない）
+ALLOWED_IMAGE_HOSTS = ("images.ygoprodeck.com",)
+REMOTE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _is_allowed_image_url(url: str) -> bool:
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    return u.scheme == "https" and (u.hostname or "") in ALLOWED_IMAGE_HOSTS
+
+
 def show_image_url(value: str | None, *, caption=None):
     if not value:
         st.write("—")
         return
     url = str(value)
     try:
-        if url.startswith(("http://", "https://")):
-            r = requests.get(url, timeout=8)
+        if _is_allowed_image_url(url):
+            r = requests.get(url, timeout=8, allow_redirects=False)
             r.raise_for_status()
+            if len(r.content) > REMOTE_IMAGE_MAX_BYTES:
+                raise ValueError("画像が大きすぎます")
             _img_fit(BytesIO(r.content), caption=caption)
         else:
-            st.warning("画像URLが無効です（ローカルパス検出）。")
+            st.warning("この画像URLは表示できません（カード画像の配信元以外は取得しません）。")
             st.caption(url)
     except Exception as e:
         st.warning("画像の読み込みに失敗しました。")
@@ -242,11 +262,86 @@ def encode_pil_to_vec(pil_img: Image.Image) -> np.ndarray:
         feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.cpu().numpy()[0].astype(np.float32)
 
-def nearest_card_by_art(rec_obj, v: np.ndarray) -> Tuple[int, str, float]:
-    sims = np.dot(rec_obj.art, v.astype(np.float32))
-    i = int(np.argmax(sims))
-    name = str(rec_obj.db.iloc[i]["name"])
-    return i, name, float(sims[i])
+# =========================
+# 画像からカード候補を探す（推薦アルゴリズム・推薦用ベクトルは変更しない）
+# =========================
+IMG_MAX_BYTES = 10 * 1024 * 1024          # アップロード上限 10MB
+IMG_MAX_PIXELS = 40_000_000               # デコード後の画素数上限（例: 8000×5000）
+Image.MAX_IMAGE_PIXELS = IMG_MAX_PIXELS   # これを大きく超える画像は PIL 側でも拒否（解凍爆弾対策）
+UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp", "gif"] + (["heic", "heif"] if HEIF_OK else [])
+CARD_HW = 614 / 421                       # 遊戯王カード画像の 縦/横
+# カードDBの画像ベクトルを作ったときの「絵柄部分の切り出し」（source_data/main_config.yaml の adaptive_crop）
+# 2011 年を境にカードの枠が変わるため 2 種類ある。アップロード画像の年代は分からないので両方試す。
+ART_BOXES = {"post": (0.11, 0.25, 0.89, 0.59), "pre": (0.125, 0.26, 0.875, 0.58)}
+IMAGE_TOPK = 5
+# 複数の切り出し方の結果をどうまとめるか: "max"=余弦の最大 / "z"=切り出し方ごとに標準化してから最大 / "rrf"=順位で統合
+IMAGE_MERGE = "z"
+
+
+def load_query_image(data: bytes) -> Image.Image:
+    """アップロードされたバイト列を安全に画像として開く。問題があれば ValueError（日本語メッセージ）"""
+    if len(data) > IMG_MAX_BYTES:
+        raise ValueError(f"ファイルが大きすぎます（上限 {IMG_MAX_BYTES // (1024 * 1024)}MB）。")
+    try:
+        im = Image.open(BytesIO(data))
+        w, h = im.size
+        if w * h > IMG_MAX_PIXELS:
+            raise ValueError(f"画像の解像度が大きすぎます（{w}×{h}）。")
+        im.load()
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("画像として読み込めませんでした（対応形式: " + ", ".join(UPLOAD_TYPES) + "）。")
+    im = ImageOps.exif_transpose(im)   # スマホ写真の向き（EXIF）を直す
+    return im.convert("RGB")
+
+
+def classify_query_image(w: int, h: int) -> str:
+    """縦横比だけで入力の種類を推定する: card=カード全体 / art=絵柄だけ(ほぼ正方形) / other=それ以外（写真・スクショ等）"""
+    r = h / max(w, 1)
+    if abs(r / CARD_HW - 1) <= 0.10:
+        return "card"
+    if 0.85 <= r <= 1.18:
+        return "art"
+    return "other"
+
+
+def query_views(img: Image.Image) -> Tuple[str, Dict[str, Image.Image]]:
+    """入力の種類に応じて、CLIP に渡す画像（切り出し方）を用意する"""
+    kind = classify_query_image(*img.size)
+    w, h = img.size
+    crops = {k: img.crop((int(l * w), int(t * h), int(r * w), int(b * h))) for k, (l, t, r, b) in ART_BOXES.items()}
+    if kind == "card":
+        return kind, crops                          # カード全体 → 絵柄部分だけ（カードDBと同じ切り出し）
+    if kind == "art":
+        return kind, {"direct": img}                # すでに絵柄だけ → そのまま
+    return kind, {"direct": img, **crops}           # 判断できない → 全部試す
+
+
+def merge_view_scores(S: np.ndarray, method: str = IMAGE_MERGE) -> np.ndarray:
+    """S: (切り出し方の数, カード数) の余弦。1 本のスコアにまとめる（大きいほど候補として上）"""
+    if S.shape[0] == 1 or method == "max":
+        return S.max(axis=0)
+    if method == "z":   # 切り出し方ごとに余弦の分布（平均・ばらつき）が違うので、標準化してから比べる
+        Z = (S - S.mean(axis=1, keepdims=True)) / (S.std(axis=1, keepdims=True) + 1e-9)
+        return Z.max(axis=0)
+    if method == "rrf":
+        ranks = np.argsort(np.argsort(-S, axis=1), axis=1) + 1
+        return (1.0 / (60.0 + ranks)).sum(axis=0)
+    raise ValueError(f"unknown merge method: {method}")
+
+
+def image_candidates(art: np.ndarray, img: Image.Image, encode, k: int = IMAGE_TOPK,
+                     method: str = IMAGE_MERGE) -> Dict[str, Any]:
+    """画像 → 上位 k 枚の候補（行番号・参考スコア・どの切り出しで一番近かったか）"""
+    kind, views = query_views(img)
+    names = list(views)
+    S = np.stack([art @ encode(views[n]).astype(np.float32) for n in names])
+    score = merge_view_scores(S, method)
+    top = np.argsort(-score)[:k]
+    return {"kind": kind, "views": names, "idx": top.tolist(),
+            "cos": S[:, top].max(axis=0).tolist(),                 # 表示用の参考値（最大の余弦）
+            "best_view": [names[j] for j in S[:, top].argmax(axis=0)]}
 
 def encode_text_to_vec(text: str) -> np.ndarray:
     if not ENCODER_OK:
@@ -257,6 +352,124 @@ def encode_text_to_vec(text: str) -> np.ndarray:
         feat = model_clip.encode_text(tokens)
         feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().numpy().astype(np.float32)[0]
+
+
+# =========================
+# 候補（テキスト・画像・カメラ）と基準カードの状態
+#   ・基準カードは st.session_state["name_select"]（ドロップダウン）だけで決める
+#   ・テキスト/画像/カメラは「候補」を作るだけ。候補をクリックしたときにドロップダウンへ書き込む
+#   ・新しい候補が来たら、古い選択は外す（ユーザーが選び直す）
+#   ・画像は内容のハッシュで覚えておき、同じ画像を再計算しない
+# =========================
+_SOURCE_LABEL = {"text": "テキスト検索", "image": "アップロード画像", "camera": "カメラ画像"}
+
+
+def _clear_candidates(source: str | None = None):
+    if source is None or st.session_state.get("cand_source") == source:
+        for k in ("cand_df", "cand_source", "cand_label", "cand_info", "cand_picked"):
+            st.session_state.pop(k, None)
+
+
+def _set_candidates(df: pd.DataFrame, source: str, label: str, info: Dict[str, Any] | None = None):
+    st.session_state.update(cand_df=df, cand_source=source, cand_label=label, cand_info=info or {}, cand_picked=None)
+    st.session_state["name_select"] = ""      # 古い基準カードの選択を外す
+    st.session_state.pop("pick_note", None)
+    st.session_state.pop("img_error", None)
+
+
+def _on_name_change():
+    """ドロップダウンで直接カードを選んだ → それが最優先。候補一覧は閉じる（画像の計算結果はキャッシュに残る）"""
+    st.session_state.pop("pick_note", None)
+    _clear_candidates()
+
+
+def _pick_candidate(name: str):
+    src, label = st.session_state.get("cand_source", ""), st.session_state.get("cand_label", "")
+    st.session_state["name_select"] = name
+    st.session_state["cand_picked"] = name
+    st.session_state["pick_note"] = (name, f"{'💬' if src == 'text' else '🖼'} {_SOURCE_LABEL.get(src, '')}"
+                                           f"「**{label}**」→ 候補から選んだ **{name}** で推薦します")
+
+
+def _repick():
+    st.session_state["cand_picked"] = None
+
+
+def _on_text_search():
+    q = (st.session_state.get("text_q") or "").strip()
+    if not q:
+        return
+    if not ENCODER_OK:
+        st.session_state["img_error"] = ("text", "CLIP が未ロードです。")
+        return
+    try:
+        sims = np.dot(rec.art, encode_text_to_vec(q))
+        top_idx = np.argsort(-sims)[: int(st.session_state.get("text_n", 5))]
+        df = rec.db.iloc[top_idx].copy()
+        df["cand_score"] = sims[top_idx]
+        _set_candidates(df.join(DF["image_url_runtime"], how="left"), "text", q)
+    except Exception as e:
+        st.session_state["img_error"] = ("text", f"テキスト検索エラー：{e}")
+
+
+def _image_to_candidates(data: bytes) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    img = load_query_image(data)
+    res = image_candidates(rec.art, img, encode_pil_to_vec)
+    df = rec.db.iloc[res["idx"]].copy()
+    df["cand_score"] = res["cos"]
+    df["cand_view"] = res["best_view"]
+    thumb = img.copy(); thumb.thumbnail((360, 360))
+    return df.join(DF["image_url_runtime"], how="left"), {"kind": res["kind"], "views": res["views"], "thumb": thumb}
+
+
+def _on_image_input(widget_key: str, source: str):
+    """画像アップロード／カメラが変わったとき（Streamlit のコールバック：同じ画像なら再計算しない）"""
+    f = st.session_state.get(widget_key)
+    if f is None:                                  # ファイルを消した → その入力の候補だけ消す（選んだ基準カードは残す）
+        _clear_candidates(source)
+        st.session_state.pop("img_error", None)
+        return
+    if not ENCODER_OK:
+        st.session_state["img_error"] = (source, "画像エンコーダが無効のため、画像検索はできません。")
+        return
+    data = f.getvalue()
+    h = hashlib.sha1(data).hexdigest()
+    cache = st.session_state.setdefault("img_cache", {})
+    try:
+        if h not in cache:
+            cache.clear()                          # 直近 1 枚分だけ覚える（メモリ節約）
+            cache[h] = _image_to_candidates(data)
+        df, info = cache[h]
+        _set_candidates(df, source, getattr(f, "name", "") or _SOURCE_LABEL[source], info)
+    except ValueError as e:                        # サイズ超過・読めない画像など
+        _clear_candidates(source)
+        st.session_state["img_error"] = (source, str(e))
+    except Exception as e:
+        _clear_candidates(source)
+        st.session_state["img_error"] = (source, f"画像検索エラー：{e}")
+
+
+def _source_status(source: str):
+    """サイドバーの各タブに、その入力の状態（エラー・選択中・選び直し）を表示する"""
+    err = st.session_state.get("img_error")
+    if err and err[0] == source:
+        st.error(err[1])
+    if st.session_state.get("cand_source") != source:
+        return
+    picked = st.session_state.get("cand_picked")
+    if picked:
+        st.success(f"🎯 選択中：**{picked}**")
+        c1, c2 = st.columns(2)
+        c1.button("↩ 候補を選び直す", key=f"repick_{source}", on_click=_repick, use_container_width=True)
+        c2.button("❌ 解除", key=f"clear_{source}", on_click=_clear_and_unselect, use_container_width=True)
+    else:
+        st.info("右側の候補から基準カードを選んでください。")
+
+
+def _clear_and_unselect():
+    _clear_candidates()
+    st.session_state["name_select"] = ""
+    st.session_state.pop("pick_note", None)
 
 # =========================
 # サイドバー（A/B 切替・検索入力・高度設定）
@@ -275,98 +488,35 @@ with st.sidebar:
 
     st.header("🛠 検索パラメータ")
     tab_name, tab_text, tab_image, tab_camera = st.tabs(["カード名", "テキスト検索", "画像から", "カメラ"])
-    effective_query_name = None
-    query = None
 
     with tab_name:
         names = [""] + DF[COL_NAME].astype(str).tolist()
-        query = st.selectbox("カード名を選択", options=names)
+        # 基準カードはこのドロップダウンの値だけで決まる（候補から選んだときもここに書き込む）
+        st.selectbox("カード名を選択", options=names, key="name_select", on_change=_on_name_change)
 
     with tab_text:
         st.caption("英語でキーワードを入力")
-        text_query = st.text_input("🔍 フリーテキスト検索", placeholder="e.g. cute girl magician")
-        n_text_candidates = st.slider("候補カード数", 3, 10, 5, 1)
-        text_search_button = st.button("🔍 候補を探す", use_container_width=True)
-
-        if text_search_button and text_query.strip():
-            if not ENCODER_OK:
-                st.error("CLIP が未ロードです。")
-            else:
-                with st.spinner("検索中…"):
-                    try:
-                        text_vec = encode_text_to_vec(text_query)
-                        sims = np.dot(rec.art, text_vec)
-                        top_idx = np.argsort(-sims)[:n_text_candidates]
-                        candidates_df = rec.db.iloc[top_idx].copy()
-                        candidates_df["text_sim"] = sims[top_idx]
-                        candidates_df = candidates_df.join(DF["image_url_runtime"], how="left")
-                        st.session_state["text_candidates"] = candidates_df
-                        st.session_state["text_query_used"] = text_query
-                        # 候補が新しく来たら選択をリセット
-                        if "text_selected_card" in st.session_state:
-                            del st.session_state["text_selected_card"]
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"エラー：{e}")
-
-        if "text_selected_card" in st.session_state:
-            selected = st.session_state["text_selected_card"]
-            st.success(f"🎯 選択中：**{selected}**")
-            if st.button("❌ 選択を解除", key="text_clear"):
-                del st.session_state["text_selected_card"]
-                if "text_candidates" in st.session_state:
-                    del st.session_state["text_candidates"]
-                st.rerun()
+        st.text_input("🔍 フリーテキスト検索", placeholder="e.g. cute girl magician", key="text_q")
+        st.slider("候補カード数", 3, 10, 5, 1, key="text_n")
+        st.button("🔍 候補を探す", use_container_width=True, on_click=_on_text_search)
+        _source_status("text")
 
     with tab_image:
-        up = st.file_uploader("画像をアップロード", type=["jpg","jpeg","png","webp","gif","heic","heif"])
-        url = st.text_input("または画像URLを貼り付け")
-        pil = None
-        if up:
-            try:
-                pil = Image.open(up)
-            except Exception as e:
-                st.error(f"画像の読み込みに失敗しました：{e}")
-        elif url:
-            try:
-                b = requests.get(url, timeout=6).content
-                pil = Image.open(BytesIO(b))
-            except Exception as e:
-                st.error(f"画像URLの取得に失敗しました：{e}")
-
-        if pil is not None:
-            _img_fit(pil, caption="クエリ画像プレビュー")
-            if ENCODER_OK:
-                with st.spinner("画像特徴を抽出中…"):
-                    try:
-                        v = encode_pil_to_vec(pil)
-                        idx, nn_name, sim = nearest_card_by_art(rec, v)
-                        effective_query_name = nn_name
-                        st.success(f"最も近いカード：**{nn_name}**（sim={sim:.3f}）")
-                    except Exception as e:
-                        st.error(f"画像検索エラー：{e}")
-            else:
-                st.info("画像のプレビューのみ（エンコーダ未有効のため検索は省略）。")
+        st.file_uploader(f"画像をアップロード（{IMG_MAX_BYTES // (1024 * 1024)}MB まで）", type=UPLOAD_TYPES,
+                         key="img_upload", on_change=_on_image_input, args=("img_upload", "image"))
+        st.caption("カード全体が写った画像なら、絵柄部分を切り出して比べます。候補 5 枚から選んでください。")
+        _source_status("image")
 
     with tab_camera:
         if ENCODER_OK:
-            cam = st.camera_input("カメラで撮影して検索", label_visibility="collapsed")
-            if cam is not None:
-                try:
-                    pil = Image.open(cam)
-                    _img_fit(pil, caption="カメラ画像プレビュー")
-                    with st.spinner("画像特徴を抽出中…"):
-                        v = encode_pil_to_vec(pil)
-                        idx, nn_name, sim = nearest_card_by_art(rec, v)
-                        effective_query_name = nn_name
-                        st.success(f"最も近いカード：**{nn_name}**（カメラ, sim={sim:.3f}）")
-                except Exception as e:
-                    st.error(f"画像検索エラー：{e}")
+            st.camera_input("カメラで撮影して検索", label_visibility="collapsed",
+                            key="cam_input", on_change=_on_image_input, args=("cam_input", "camera"))
+            _source_status("camera")
         else:
             st.info("torch/open-clip が未インストールのため、カメラ検索は無効です。")
 
-    if not effective_query_name:
-        effective_query_name = st.session_state.get("text_selected_card") or query or None
+    # 基準カード = ドロップダウンの値（最後にユーザーが明示的に選んだカード）
+    effective_query_name = st.session_state.get("name_select") or None
 
     with st.expander("Advanced（研究者向け）", expanded=True):
         topk    = synced_slider("Top-K（表示件数）", 6, 36, 18, 2, key="topk")
@@ -627,27 +777,39 @@ if debug:
     st.dataframe(DF[[COL_NAME, "image_url_runtime"]].head(10))
 
 # =========================
-# ★ テキスト検索の候補を主画面に表示
+# ★ 候補カード（テキスト検索・画像・カメラ共通）を主画面に表示。クリックで基準カードに決める
 # =========================
-if "text_candidates" in st.session_state and "text_selected_card" not in st.session_state:
-    cands = st.session_state["text_candidates"]
-    used_q = st.session_state.get("text_query_used", "")
-    st.subheader(f"🔍「{used_q}」の候補カード")
-    st.caption("カードをクリックして選択すると、そのカードを基準に推薦します")
+_cands = st.session_state.get("cand_df")
+if _cands is not None and not st.session_state.get("cand_picked"):
+    _src = st.session_state.get("cand_source", "")
+    _label = st.session_state.get("cand_label", "")
+    _info = st.session_state.get("cand_info", {}) or {}
+    if _src == "text":
+        st.subheader(f"🔍「{_label}」の候補カード")
+    else:
+        st.subheader(f"🖼 {_SOURCE_LABEL.get(_src, '画像')}の候補カード（上位 {len(_cands)} 枚）")
+        _kind_text = {"card": "カード全体の画像 → 絵柄部分を切り出して比較しました",
+                      "art": "絵柄だけの画像 → そのまま比較しました",
+                      "other": "カード全体か判断できない画像 → 画像全体と、絵柄の切り出しの両方で比較しました"}
+        c_img, c_txt = st.columns([1, 5])
+        if _info.get("thumb") is not None:
+            c_img.image(_info["thumb"], width=120)
+        c_txt.caption("判定：" + _kind_text.get(_info.get("kind", ""), "—"))
+        c_txt.caption("※ 下の数値は CLIP の画像ベクトルの近さ（参考値）で、正しく識別できた確率ではありません。"
+                      "正しいカードが 1 位とは限らないので、目で確認して選んでください。")
+    st.caption("カードを選ぶと、そのカードを基準に推薦します（その後「🔮 検索」を押してください）")
 
-    cols = st.columns(len(cands))
-    for i, (col, (_, row)) in enumerate(zip(cols, cands.iterrows())):
+    cols = st.columns(len(_cands))
+    for i, (col, (_, row)) in enumerate(zip(cols, _cands.iterrows())):
         with col:
             card_name = str(row[COL_NAME])
             img_url = image_url_for_row(row) or ""
-            sim_pct = int(float(row["text_sim"]) * 100)
-            if img_url:
-                show_image_url(img_url)
+            if img_url and _is_allowed_image_url(img_url):
+                st.image(img_url, use_column_width=True)   # URL のまま渡す＝ブラウザが直接読み込む（サーバー側では取得しない）
             st.caption(f"**{card_name}**")
-            st.caption(f"類似度: {sim_pct}%")
-            if st.button("✅ 選択", key=f"main_sel_{i}", use_container_width=True):
-                st.session_state["text_selected_card"] = card_name
-                st.rerun()
+            st.caption(f"近さ（参考）: {float(row['cand_score']):.3f}")
+            st.button("✅ 選択", key=f"main_sel_{i}", use_container_width=True,
+                      on_click=_pick_candidate, args=(card_name,))
 
     st.divider()
 
@@ -670,8 +832,8 @@ def _cfg_changes(entry: Dict[str, Any], current: Dict[str, Any]) -> list[str]:
     """表示中の結果（entry に保存した設定）と、いまサイドバーで選ばれている設定の違いを列挙する。
     結果に効かない値（rrf のときの p、MMR OFF のときの λ）は比べない。"""
     ch = []
-    if current.get("query_name") and current["query_name"] != entry["query_name"]:
-        ch.append(f"基準カード: {entry['query_name']} → {current['query_name']}")
+    if current.get("query_name") != entry["query_name"]:
+        ch.append(f"基準カード: {entry['query_name']} → {current.get('query_name') or '未選択'}")
     if current["ab_system"] != entry["ab_system"]:
         ch.append(f"System {entry['ab_system']} → {current['ab_system']}")
     if current["fusion"] != entry["fusion"]:
@@ -746,9 +908,9 @@ if fire:
         st.warning("基準となるカード（または画像）を選んでください。")
     else:
         text_note = None
-        if st.session_state.get("text_selected_card") == effective_query_name:
-            used_query = st.session_state.get("text_query_used", "")
-            text_note = f"💬 テキスト検索「**{used_query}**」→ **{effective_query_name}** で推薦します"
+        _pn = st.session_state.get("pick_note")
+        if _pn and _pn[0] == effective_query_name:   # 候補から選んだカードで検索したときだけ、経緯を表示
+            text_note = _pn[1]
 
         base_df = DF[DF[COL_NAME] == effective_query_name]
 
@@ -809,5 +971,5 @@ if history:
     if st.button("🗑 検索履歴をクリア"):
         st.session_state["history"] = []
         st.rerun()
-elif "text_candidates" not in st.session_state:
+elif st.session_state.get("cand_df") is None:
     st.info("左側でカード名を選ぶか、テキスト/画像/カメラで検索して「🔮 検索」を押してください。")
