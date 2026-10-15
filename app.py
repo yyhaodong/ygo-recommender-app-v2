@@ -609,7 +609,7 @@ st.markdown(
     ".ygo-pill-b{background:rgba(22,163,74,.15);border-color:rgba(22,163,74,.6);color:#bfe8cc;}"
     ".ygo-pill-a{background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.6);color:#c7dbff;}"
     "</style>"
-    f'<div class="ygo-status"><span class="ygo-pill {_sys_cls}">🧪 現在テスト中：{_esc(_sys_label)}</span>'
+    f'<div class="ygo-status"><span class="ygo-pill {_sys_cls}">🎛 選択中：{_esc(_sys_label)}</span>'
     f'<span class="ygo-pill">🔧 {_esc(ENCODER_LABEL)}</span></div>',
     unsafe_allow_html=True,
 )
@@ -656,8 +656,48 @@ if "text_candidates" in st.session_state and "text_selected_card" not in st.sess
 # =========================
 MAX_HISTORY = 5   # 1ページに残す検索結果の数（最新 + 過去4件）
 
-def render_history_entry(entry: Dict[str, Any], nested: bool = False):
-    """1回分の検索結果（基準カード・設定・Top-N）を描画する。nested=True は expander の中（expander を入れ子にできない）。"""
+def _entry_cfg_text(cfg: Dict[str, Any]) -> str:
+    """検索時に保存した設定（entry）を1行の文字列にする"""
+    t = f"System {cfg['ab_system']} ／ 融合: {cfg['fusion']}"
+    if cfg["fusion"] == "power_mean":
+        t += f"（p={cfg['p_power']:.1f}）"
+    t += " ／ MMR: " + (f"λ={cfg['mmr_lambda']:.2f}" if cfg["use_mmr"] else "OFF")
+    t += f" ／ k_each={cfg['k_each']} ／ Top-{cfg['topk']}"
+    return t
+
+
+def _cfg_changes(entry: Dict[str, Any], current: Dict[str, Any]) -> list[str]:
+    """表示中の結果（entry に保存した設定）と、いまサイドバーで選ばれている設定の違いを列挙する。
+    結果に効かない値（rrf のときの p、MMR OFF のときの λ）は比べない。"""
+    ch = []
+    if current.get("query_name") and current["query_name"] != entry["query_name"]:
+        ch.append(f"基準カード: {entry['query_name']} → {current['query_name']}")
+    if current["ab_system"] != entry["ab_system"]:
+        ch.append(f"System {entry['ab_system']} → {current['ab_system']}")
+    if current["fusion"] != entry["fusion"]:
+        ch.append(f"融合 {entry['fusion']} → {current['fusion']}")
+    elif current["fusion"] == "power_mean" and abs(current["p_power"] - entry["p_power"]) > 1e-9:
+        ch.append(f"p {entry['p_power']:.1f} → {current['p_power']:.1f}")
+    if current["use_mmr"] != entry["use_mmr"]:
+        ch.append("MMR " + ("ON → OFF" if entry["use_mmr"] else "OFF → ON"))
+    elif current["use_mmr"] and abs(current["mmr_lambda"] - entry["mmr_lambda"]) > 1e-9:
+        ch.append(f"λ {entry['mmr_lambda']:.2f} → {current['mmr_lambda']:.2f}")
+    if current["k_each"] != entry["k_each"]:
+        ch.append(f"k_each {entry['k_each']} → {current['k_each']}")
+    if current["topk"] != entry["topk"]:
+        ch.append(f"Top-K {entry['topk']} → {current['topk']}")
+    return ch
+
+
+def render_history_entry(entry: Dict[str, Any], nested: bool = False, current: Dict[str, Any] | None = None):
+    """1回分の検索結果（基準カード・設定・Top-N）を描画する。nested=True は expander の中（expander を入れ子にできない）。
+    表示する設定は、必ず検索したときに entry に保存した値を使う（サイドバーの現在値は使わない）。
+    current（いまの設定）を渡すと、違いがあるときに「再検索で反映」の警告を出す。"""
+    if current is not None:
+        changes = _cfg_changes(entry, current)
+        if changes:
+            st.warning("設定が変更されています。再検索すると反映されます。\n\n"
+                       "下の結果は前回の設定のままです（変更：" + "、".join(changes) + "）", icon="⚠️")
     if entry.get("text_note"):
         st.info(entry["text_note"])
     base_row = entry.get("base_row")
@@ -672,16 +712,13 @@ def render_history_entry(entry: Dict[str, Any], nested: bool = False):
     with shot_col:
         screenshot_mode = st.toggle("📸 先頭4枚のみ", value=False, key=f"shot_{entry['id']}",
                                     help="スクリーンショット用：先頭4枚だけ表示します")
+    _cls = "ygo-pill-a" if entry["ab_system"] == "A" else "ygo-pill-b"
+    st.markdown(f'<div class="ygo-status"><span class="ygo-pill {_cls}">🧾 この結果の設定：'
+                f'{_esc(_entry_cfg_text(entry))}</span></div>', unsafe_allow_html=True)
     render_results_grid(results.head(4) if screenshot_mode else results, n_cols=4)
 
-    # 設定と注意書きは結果の下にまとめる
+    # 注意書きは結果の下にまとめる
     st.markdown('<div style="height:.75rem"></div>', unsafe_allow_html=True)
-    cfg = f"System {entry['ab_system']} ／ 融合: {entry['fusion']}"
-    if entry["fusion"] == "power_mean":
-        cfg += f"（p={entry['p_power']:.1f}）"
-    cfg += " ／ MMR: " + (f"λ={entry['mmr_lambda']:.2f}" if entry["use_mmr"] else "OFF")
-    cfg += f" ／ k_each={entry['k_each']}"
-    st.caption("🧾 この検索の設定： " + cfg)
 
     if entry["use_mmr"]:
         st.caption("※ MMR が有効なので、並び順は総合スコア順ではありません。"
@@ -755,7 +792,12 @@ if fire:
 # 履歴は session_state にあるので、ボタンやスライダーを操作して画面が再実行されても消えない
 history = st.session_state.get("history", [])
 if history:
-    render_history_entry(history[0])
+    current_cfg = {
+        "query_name": effective_query_name, "ab_system": ab_system, "fusion": fusion,
+        "p_power": float(p_power), "use_mmr": bool(use_mmr), "mmr_lambda": float(mmr_lambda),
+        "k_each": int(k_each), "topk": int(topk),
+    }
+    render_history_entry(history[0], current=current_cfg)
     if len(history) > 1:
         st.divider()
         st.markdown(f"#### 🕘 過去の検索（{len(history) - 1}件・最大{MAX_HISTORY}件まで保持）")
