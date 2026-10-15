@@ -407,23 +407,78 @@ with st.sidebar:
 # =========================
 # 結果カードの描画
 # =========================
+# --- 基準カードのサイズ設定 ---------------------------------------------
+# 下の推薦グリッド（render_results_grid の .ygo-grid）と同じ値。グリッド側を変えたらここも合わせる。
+GRID_MIN_PX = 160      # grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))
+GRID_GAP_PX = 12       # gap: 12px
+CARD_INSET_PX = 18     # .ygo-card の padding 8px×2 + border 1px×2（画像はこの分だけ列幅より狭い）
+BASE_AREA_RATIO = 1.75 # 基準カードの面積 ÷ 推薦カード1枚の面積（1.5〜2 の中間）
+CARD_ASPECT = "421 / 614"  # YGOPRODeck のカード画像の縦横比（変形・切り抜きなし）
+
+
+def _base_card_css() -> str:
+    """基準カードの幅を「推薦カード1枚の幅 × √面積比」にする CSS を作る。
+
+    推薦グリッドは auto-fill なので、列数 n はコンテナ幅 W で決まる：
+        n = floor((W + gap) / (min + gap))、列幅 w = (W − gap·(n−1)) / n
+    コンテナクエリで n ごとの区間を書き、その区間の w を 100cqw（= W）から計算する。
+    これで画面幅・ズームが変わっても、推薦カードとの面積比が常に BASE_AREA_RATIO になる。
+    """
+    r = BASE_AREA_RATIO ** 0.5
+    step = GRID_MIN_PX + GRID_GAP_PX
+
+    def width_for(n: int) -> str:
+        return (f"calc({r:.4f} * ((100cqw - {GRID_GAP_PX * (n - 1)}px) / {n} - {CARD_INSET_PX}px))")
+
+    rules = [
+        ".ygo-base-wrap{container-type:inline-size;container-name:ygo-base;width:100%;margin:0 0 .25rem 0;}",
+        ".ygo-base{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;width:100%;}",
+        # 1行目はコンテナクエリ非対応ブラウザ用の控えめな固定上限、2行目が本来の計算式
+        f".ygo-base-img{{flex:0 0 auto;max-width:100%;width:min(100%,200px);width:{width_for(1)};}}",
+        f".ygo-base-img img{{display:block;width:100%;height:auto;aspect-ratio:{CARD_ASPECT};"
+        "object-fit:contain;border-radius:6px;}",
+        ".ygo-base-info{flex:1 1 260px;min-width:0;}",
+        ".ygo-base-name{font-size:1.5rem;font-weight:600;line-height:1.3;margin:0 0 .25rem 0;}",
+        ".ygo-base-meta{font-size:.875rem;opacity:.7;margin-bottom:.5rem;}",
+        ".ygo-base-desc{font-size:.95rem;line-height:1.6;word-break:break-word;}",
+    ]
+    for n in range(2, 25):  # 列数 2〜24（W ≈ 4,100px まで）
+        rules.append(f"@container ygo-base (min-width:{step * n - GRID_GAP_PX}px)"
+                     f"{{.ygo-base-img{{width:{width_for(n)};}}}}")
+    # 推薦グリッドは画面幅 480px 以下で 2 列固定になるので、そこに合わせる（最後に置いて優先させる）
+    rules.append(f"@media (max-width:480px){{.ygo-base-img{{width:{width_for(2)};}}}}")
+    return "<style>" + "".join(rules) + "</style>"
+
+
 def render_card_full(row: pd.Series | Dict[str, Any]):
+    """基準カード：画像は推薦カードの約 1.75 倍の面積、右に名前・種別・効果テキスト。
+
+    st.columns の比率ではなく HTML + CSS（flex + コンテナクエリ）で描く。
+    Streamlit 内部のクラス名には依存しない（自前の .ygo-base-* だけを使う）。
+    """
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     img_url = image_url_for_row(row) or ""
-    name = str(d.get(COL_NAME, "Unknown"))
-    desc = d.get(COL_DESC) or "—"
-    type_v = fmt(d.get(COL_TYPE))
-    atk_v  = fmt(d.get(COL_ATK))
-    def_v  = fmt(d.get(COL_DEF))
-    col_img, col_info = st.columns([1, 3])
-    with col_img:
-        if img_url:
-            show_image_url(img_url)
-    with col_info:
-        st.markdown(f"### {name}")
-        st.caption(f"種別: {type_v} | ATK: {atk_v} | DEF: {def_v}")
-        if COL_DESC:
-            st.write(desc)
+    name = _esc(str(d.get(COL_NAME, "Unknown")))
+    type_v = _esc(fmt(d.get(COL_TYPE)))
+    atk_v  = _esc(fmt(d.get(COL_ATK)))
+    def_v  = _esc(fmt(d.get(COL_DEF)))
+    desc_html = ""
+    if COL_DESC:
+        # 空行があると Markdown の HTML ブロックが途切れるので、改行は <br> にする
+        desc = str(d.get(COL_DESC) or "—")
+        desc_html = '<div class="ygo-base-desc">' + _esc(desc).replace("\r", "").replace("\n", "<br>") + "</div>"
+    img_html = (f'<div class="ygo-base-img"><img src="{_esc(img_url)}" alt="{name}"></div>' if img_url else "")
+    html = (
+        _base_card_css()
+        + '<div class="ygo-base-wrap"><div class="ygo-base">'
+        + img_html
+        + '<div class="ygo-base-info">'
+        + f'<div class="ygo-base-name">{name}</div>'
+        + f'<div class="ygo-base-meta">種別: {type_v} | ATK: {atk_v} | DEF: {def_v}</div>'
+        + desc_html
+        + "</div></div></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 def render_card_compact(row: pd.Series | Dict[str, Any]):
     d = row.to_dict() if isinstance(row, pd.Series) else dict(row)
@@ -441,6 +496,7 @@ def render_card_compact(row: pd.Series | Dict[str, Any]):
             st.markdown("**効果テキスト / Notes**")
             st.write(d.get(COL_DESC) or "—")
 
+# ※ 下の 160px / 12px / padding 8px は GRID_MIN_PX / GRID_GAP_PX / CARD_INSET_PX（基準カードの大きさ計算）と連動
 def render_results_grid(results_df: pd.DataFrame, n_cols: int = 4):
     st.markdown("""
     <style>
