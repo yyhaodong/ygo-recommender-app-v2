@@ -24,6 +24,7 @@
 
 - カード情報：YGOPRODeck API（13,342 枚。テキストは英語、1 カード名につき画像 1 枚）
 - アプリは Hugging Face のデータセット [`oneonehaodong/ygo-recommender-data`](https://huggingface.co/datasets/oneonehaodong/ygo-recommender-data) を読み込む。
+- `optimized_data_for_upload/` は、そのデータセット（revision `3d53e6c`）と同じベクトルにそろえてある。`source_data/lore_embeddings.npy` も同じ 384 次元版。
 
 ## 検証スクリプト
 
