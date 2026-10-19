@@ -6,8 +6,11 @@ paths:
   art_embeddings_file: "data/processed/art_embeddings.npy"
   meta_embeddings_file: "data/processed/meta_embeddings.npy"
   lore_embeddings_file: "data/processed/lore_embeddings.npy"
-clip_model: "openai/clip-vit-base-patch32"
-sentence_transformer_model: "pkshatech/simcse-ja-bert-base-clcmlp"
+clip_model: "openai/clip-vit-base-patch32"   # 画像ベクトルの生成に使用（アプリの検索時は open_clip の ViT-B-32-quickgelu。同じ OpenAI の重み）
+# 公開中の lore_embs（384 次元）を生成したモデル。カードの説明文（desc）だけを入力。
+# 2026-10-19 に、保存済みベクトルとこのモデルで計算し直したベクトルが一致することを確認。
+# 初期版は日本語モデル "pkshatech/simcse-ja-bert-base-clcmlp"（768 次元）だったが、説明文が英語のため置き換えた。
+sentence_transformer_model: "sentence-transformers/all-MiniLM-L6-v2"
 adaptive_crop:
   crossover_date: "2011-03-19"
   pre_crossover_coords: [0.125, 0.26, 0.875, 0.58]

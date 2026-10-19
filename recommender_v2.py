@@ -222,7 +222,8 @@ class RecommenderV2:
     """
 
     # CLIP model name (detected by detect_clip_model.py)
-    _CLIP_MODEL_NAME = "ViT-B-32"
+    # 画像ベクトルは OpenAI の CLIP（QuickGELU）で作られているので、検索側も QuickGELU 版にそろえる（app.py と同じ）
+    _CLIP_MODEL_NAME = "ViT-B-32-quickgelu"
     _CLIP_PRETRAINED = "openai"
 
     def __init__(self, card_df, art_embs, lore_embs, meta_embs,
